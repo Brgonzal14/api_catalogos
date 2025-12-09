@@ -8,6 +8,7 @@ from fastapi import (
     Query,
     HTTPException,
 )
+from sqlalchemy.orm import Session, joinedload
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import OperationalError
