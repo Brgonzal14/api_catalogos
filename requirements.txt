@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+SQLAlchemy
+psycopg2-binary
+python-multipart
+pandas
+tabula-py
+PyPDF2
+python-dotenv
+openpyxl
+pdfplumber

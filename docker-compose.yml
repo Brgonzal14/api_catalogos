@@ -1,0 +1,27 @@
+version: "3.9"
+
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: catalogos
+      POSTGRES_PASSWORD: catalogos
+      POSTGRES_DB: catalogos_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - db_data:/var/lib/postgresql/data
+
+  api:
+    build: .
+    depends_on:
+      - db
+    environment:
+      DATABASE_URL: postgresql://catalogos:catalogos@db:5432/catalogos_db
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./app:/app/app   # para editar en Visual Studio y ver cambios
+
+volumes:
+  db_data:

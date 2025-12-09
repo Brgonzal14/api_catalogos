@@ -1,0 +1,82 @@
+# API de Catálogos Aeronáuticos
+
+Este proyecto implementa una **API para unificar catálogos de componentes aeronáuticos**, permitiendo:
+
+- Recibir catálogos de distintos proveedores en formatos heterogéneos (Excel/CSV).
+- Normalizar columnas (códigos de pieza, descripción, precios, rangos de cantidad, etc.).
+- Almacenar toda la información en una base de datos relacional.
+- Buscar piezas por código o prefijo (ej. `ADF`, `ADF123`) para obtener todas sus variantes (ej. `ADF123-01`, `ADF123-45`).
+- Registrar catálogos por **empresa** y **año**, de forma que puedan actualizarse semestral o anualmente.
+
+La solución está pensada para una empresa aeronáutica que compra y vende piezas de avión y recibe catálogos muy distintos según el proveedor.
+
+---
+
+## Arquitectura
+
+- **Backend / API**: [FastAPI](https://fastapi.tiangolo.com/) (Python)
+- **Base de datos**: PostgreSQL
+- **ORM**: SQLAlchemy
+- **Contenedores**: Docker + Docker Compose
+- **Front simple**: HTML/JavaScript estático para búsqueda de piezas
+
+### Servicios
+
+- `db`: contenedor con PostgreSQL 16.
+- `api`: contenedor con FastAPI que expone la API en `http://localhost:8000`.
+
+---
+
+## Modelo de datos
+
+Para soportar catálogos con columnas muy diferentes, se usa un diseño flexible:
+
+- `suppliers`  
+  Representa proveedores/empresas (ej. *PANASONIC*, *STUKERJURGEN*).
+
+- `catalogs`  
+  Cada catálogo corresponde a un proveedor + año + archivo original.
+
+- `parts`  
+  Piezas o ítems individuales, por ejemplo:
+  - `ADF123-01`
+  - `ADF123-45`
+
+  Se separa el código en:
+  - `part_number_full` → código completo (`ADF123-01`)
+  - `part_number_root` → raíz común para variantes (`ADF123`)
+
+- `price_tiers`  
+  Rangos de precio según cantidad comprada (ej. 1–10 unidades, 11–50 unidades, etc.).
+
+- `part_attributes`  
+  Atributos flexibles para columnas adicionales que no están estandarizadas (color, material, lead time, etc.).  
+  Esto permite que:
+
+  - Si un catálogo no tiene ciertas columnas → simplemente no se crean atributos.
+  - Si un catálogo trae columnas extra → se guardan aquí sin romper el modelo.
+
+---
+
+## Requisitos
+
+- [Docker Desktop](https://www.docker.com/) (o Docker + Docker Compose)
+- Git / Visual Studio / Visual Studio Code (opcional, para editar el código)
+
+---
+
+## Estructura del proyecto
+
+```text
+catalogos-api/
+├─ app/
+│  ├─ __init__.py
+│  ├─ db.py          # Configuración de la base de datos (SQLAlchemy)
+│  ├─ models.py      # Modelos/tablas de la BD
+│  ├─ schemas.py     # Esquemas Pydantic para respuestas de la API
+│  ├─ main.py        # Definición de la API (endpoints)
+│  └─ static/
+│      └─ index.html # Front simple para búsquedas (opcional)
+├─ requirements.txt  # Dependencias de Python
+├─ Dockerfile        # Imagen de la API
+└─ docker-compose.yml# Orquestación de servicios (API + BD)
