@@ -723,13 +723,13 @@ async def upload_catalog(
 
 
 # ============================================================
-#  Endpoint: búsqueda de piezas
+#  Endpoint: búsqueda de piezas (incluye nombre del proveedor)
 # ============================================================
-@app.get("/parts/search", response_model=List[schemas.PartOut])
+@app.get("/parts/search")
 def search_parts(
     query: str = Query(
         ...,
-        alias="q",
+        alias="q",  # ?q= en la URL
         min_length=1,
         description="Código o parte de la descripción",
     ),
@@ -742,8 +742,10 @@ def search_parts(
     like_prefix = f"{q}%"
     like_any = f"%{q}%"
 
-    parts = (
-        db.query(models.Part)
+    # Hacemos JOIN con Supplier para obtener el nombre del proveedor
+    rows = (
+        db.query(models.Part, models.Supplier)
+        .join(models.Supplier, models.Part.supplier_id == models.Supplier.id)
         .filter(
             or_(
                 models.Part.part_number_full.ilike(like_prefix),
@@ -756,4 +758,42 @@ def search_parts(
         .all()
     )
 
-    return parts
+    results = []
+
+    for part, supplier in rows:
+        # Convertimos el objeto SQLAlchemy a un dict “plano”
+        item = {
+            "id": part.id,
+            "part_number_full": part.part_number_full,
+            "part_number_root": part.part_number_root,
+            "description": part.description,
+            "currency": part.currency,
+            "base_price": part.base_price,
+            "min_qty_default": part.min_qty_default,
+            "catalog_id": part.catalog_id,
+            "supplier_id": part.supplier_id,
+            # 👇 ESTE es el campo que usará el front
+            "supplier_name": supplier.name,
+            # relaciones
+            "price_tiers": [
+                {
+                    "id": pt.id,
+                    "min_qty": pt.min_qty,
+                    "max_qty": pt.max_qty,
+                    "unit_price": pt.unit_price,
+                    "currency": pt.currency,
+                }
+                for pt in getattr(part, "price_tiers", [])
+            ],
+            "attributes": [
+                {
+                    "id": attr.id,
+                    "attr_name": attr.attr_name,
+                    "attr_value": attr.attr_value,
+                }
+                for attr in getattr(part, "attributes", [])
+            ],
+        }
+        results.append(item)
+
+    return results
