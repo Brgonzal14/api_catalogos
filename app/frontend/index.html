@@ -1,0 +1,692 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <title>Catálogos de Repuestos - Demo</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- Bootstrap -->
+  <link
+    href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css"
+    rel="stylesheet"
+  />
+  <style>
+    body {
+      background: #0f172a;
+      color: #e5e7eb;
+    }
+    .navbar {
+      background: #020617;
+    }
+    .card {
+      background: #020617;
+      border: 1px solid #1f2937;
+    }
+    .form-control,
+    .form-select {
+      background: #020617;
+      color: #e5e7eb;
+      border-color: #1f2937;
+    }
+    .form-control:focus,
+    .form-select:focus {
+      box-shadow: none;
+      border-color: #3b82f6;
+    }
+    .btn-primary {
+      background: #3b82f6;
+      border-color: #3b82f6;
+    }
+    .badge-pill {
+      border-radius: 999px;
+    }
+    .table-dark {
+      --bs-table-bg: #020617;
+      --bs-table-striped-bg: #020617;
+      --bs-table-striped-color: #e5e7eb;
+    }
+    .tab-btn.active {
+      background: #111827 !important;
+      color: #e5e7eb !important;
+    }
+    .small-label {
+      font-size: 0.8rem;
+      color: #9ca3af;
+    }
+  </style>
+</head>
+<body>
+  <!-- NAVBAR -->
+  <nav class="navbar navbar-expand-lg navbar-dark mb-4">
+    <div class="container">
+      <a class="navbar-brand fw-bold" href="#">
+        Catálogos Repuestos
+      </a>
+      <span class="navbar-text small text-secondary">
+        Demo de avances · FastAPI + Base de datos
+      </span>
+    </div>
+  </nav>
+
+  <div class="container mb-5">
+    <!-- HEADER / RESUMEN -->
+    <div class="row g-3 mb-4">
+      <div class="col-md-8">
+        <div class="card h-100">
+          <div class="card-body">
+            <h4 class="card-title mb-2">Vista de demostración</h4>
+            <p class="mb-2">
+              Esta interfaz muestra los <strong>avances de la app</strong>:
+            </p>
+            <ul class="mb-0">
+              <li>Búsqueda unificada de repuestos por código o descripción.</li>
+              <li>Visualización de información clave de cada pieza.</li>
+              <li>Carga de nuevos catálogos en Excel/PDF hacia el backend.</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      <!-- “Métricas” / estado (demo) -->
+      <div class="col-md-4">
+        <div class="card h-100">
+          <div class="card-body">
+            <h6 class="text-secondary small mb-2">Estado (demo)</h6>
+            <div class="d-flex justify-content-between mb-2">
+              <span class="small-label">Catálogos cargados</span>
+              <span class="badge bg-primary badge-pill" id="statCatalogs">–</span>
+            </div>
+            <div class="d-flex justify-content-between mb-2">
+              <span class="small-label">Repuestos en BD</span>
+              <span class="badge bg-success badge-pill" id="statParts">–</span>
+            </div>
+            <div class="d-flex justify-content-between">
+              <span class="small-label">Última actualización</span>
+              <span class="small" id="statUpdated">–</span>
+            </div>
+            <div class="mt-3 small text-secondary">
+              * Puedes conectar estos números a un endpoint como
+              <code>/stats</code> más adelante.
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- TABS -->
+    <div class="mb-3">
+      <div class="btn-group" role="group">
+        <button
+          type="button"
+          class="btn btn-outline-light tab-btn active"
+          data-target="#tab-search"
+        >
+          🔍 Buscar repuesto
+        </button>
+        <button
+          type="button"
+          class="btn btn-outline-light tab-btn"
+          data-target="#tab-upload"
+        >
+          📤 Cargar catálogo
+        </button>
+      </div>
+    </div>
+
+    <!-- TAB: BUSCAR -->
+    <div id="tab-search" class="tab-content-section">
+      <!-- BUSCADOR -->
+      <div class="card mb-3">
+        <div class="card-body">
+          <h5 class="card-title mb-3">Buscar repuestos</h5>
+          <form id="searchForm" class="row g-3">
+            <div class="col-md-5">
+              <label class="form-label small-label">Código o descripción</label>
+              <input
+                type="text"
+                class="form-control"
+                id="searchQuery"
+                placeholder="Ej: 10296, Light Diffuser, etc."
+                required
+              />
+            </div>
+            <div class="col-md-3">
+              <label class="form-label small-label">Proveedor (opcional)</label>
+              <input
+                type="text"
+                class="form-control"
+                id="searchVendor"
+                placeholder="Ej: STUKERJURGEN"
+              />
+            </div>
+            <div class="col-md-2">
+              <label class="form-label small-label">Moneda (opcional)</label>
+              <select class="form-select" id="searchCurrency">
+                <option value="">Todas</option>
+                <option value="USD">USD</option>
+                <option value="EUR">EUR</option>
+              </select>
+            </div>
+            <div class="col-md-2 d-flex align-items-end">
+              <button class="btn btn-primary w-100" type="submit">
+                Buscar
+              </button>
+            </div>
+          </form>
+          <div id="searchStatus" class="mt-2 small text-secondary"></div>
+        </div>
+      </div>
+
+      <!-- RESULTADOS -->
+      <div class="card">
+        <div class="card-body">
+          <h6 class="mb-3 text-secondary">Resultados</h6>
+          <div class="table-responsive">
+            <table class="table table-dark table-striped align-middle">
+              <thead>
+                <tr>
+                  <th>Código</th>
+                  <th>Descripción</th>
+                  <th>Proveedor</th>
+                  <th>Detalle</th>
+                </tr>
+              </thead>
+              <tbody id="resultsBody">
+                <tr>
+                  <td colspan="4" class="text-center text-secondary">
+                    Sin resultados todavía. Realiza una búsqueda.
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div id="resultsCount" class="small text-secondary mt-2"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- TAB: UPLOAD -->
+    <div id="tab-upload" class="tab-content-section" style="display: none;">
+      <div class="card">
+        <div class="card-body">
+          <h5 class="card-title mb-3">Cargar nuevo catálogo</h5>
+          <p class="small text-secondary">
+            Aquí puedes subir archivos Excel o PDF de proveedores como Panasonic,
+            Stukerjurgen, Airtec, etc. El backend se encarga de leerlos y
+            normalizar los repuestos.
+          </p>
+
+          <form id="uploadForm" class="row g-3">
+            <div class="col-md-4">
+              <label class="form-label small-label">Archivo</label>
+              <input
+                class="form-control"
+                type="file"
+                id="catalogFile"
+                accept=".xlsx,.xls,.pdf"
+                required
+              />
+            </div>
+            <div class="col-md-4">
+              <label class="form-label small-label">Proveedor / Catálogo</label>
+              <input
+                type="text"
+                class="form-control"
+                id="catalogVendor"
+                placeholder="Ej: PANASONIC SPPC2023"
+                required
+              />
+            </div>
+            <div class="col-md-2">
+              <label class="form-label small-label">Moneda (para mostrar)</label>
+              <select class="form-select" id="catalogCurrency" required>
+                <option value="USD">USD</option>
+                <option value="EUR">EUR</option>
+              </select>
+            </div>
+            <div class="col-md-2 d-flex align-items-end">
+              <button class="btn btn-primary w-100" type="submit">
+                Subir
+              </button>
+            </div>
+          </form>
+
+          <div id="uploadStatus" class="mt-3 small"></div>
+
+          <hr class="border-secondary my-4" />
+
+          <div class="small text-secondary">
+            </em>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL DETALLE AMIGABLE -->
+  <div class="modal fade" id="detailModal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-lg modal-dialog-scrollable">
+      <div class="modal-content" style="background:#020617;color:#e5e7eb;">
+        <div class="modal-header">
+          <h5 class="modal-title" id="detailTitle">Detalle del repuesto</h5>
+          <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Cerrar"></button>
+        </div>
+        <div class="modal-body">
+          <p class="small text-secondary mb-3">
+            Aquí se muestra toda la información del producto de forma resumida y entendible.
+          </p>
+
+          <!-- Contenido amigable -->
+          <div id="detailContent"></div>
+
+          <hr class="border-secondary my-3" />
+
+          <!-- JSON crudo, solo si alguien quiere verlo -->
+          <details class="small text-secondary">
+            <summary>Ver JSON completo (modo desarrollador)</summary>
+            <pre id="detailJsonRaw" style="background:#020617;border-radius:0.5rem;padding:1rem;font-size:0.8rem;max-height:40vh;overflow:auto;"></pre>
+          </details>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary btn-sm" data-bs-dismiss="modal">Cerrar</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Bootstrap JS -->
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+
+  <script>
+    const API_BASE = "http://localhost:8000";
+    let lastResults = [];
+
+    // ----- Tabs -----
+    const tabButtons = document.querySelectorAll(".tab-btn");
+    const tabSections = document.querySelectorAll(".tab-content-section");
+    tabButtons.forEach((btn) => {
+      btn.addEventListener("click", () => {
+        tabButtons.forEach((b) => b.classList.remove("active"));
+        btn.classList.add("active");
+        const target = btn.getAttribute("data-target");
+        tabSections.forEach((sec) => {
+          sec.style.display = sec.id === target.substring(1) ? "block" : "none";
+        });
+      });
+    });
+
+    // Helpers
+    function formatLabel(key) {
+      return key
+        .replace(/_/g, " ")
+        .replace(/\b\w/g, (ch) => ch.toUpperCase());
+    }
+
+    function escapeHtml(str) {
+      return String(str)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
+    }
+
+    // ----- Detalle amigable -----
+    function showDetail(index) {
+      const item = lastResults[index];
+      if (!item) return;
+
+      const code = item.part_number_full || item.part_number_root || "";
+      const desc = item.description || "";
+
+      const titleEl = document.getElementById("detailTitle");
+      const contentEl = document.getElementById("detailContent");
+      const rawPreEl = document.getElementById("detailJsonRaw");
+
+      if (code && desc) {
+        titleEl.textContent = `${code} – ${desc}`;
+      } else if (code) {
+        titleEl.textContent = `Detalle de ${code}`;
+      } else {
+        titleEl.textContent = "Detalle del repuesto";
+      }
+
+      rawPreEl.textContent = JSON.stringify(item, null, 2);
+
+      const mainRows = [];
+      mainRows.push(["Código completo", code || "–"]);
+      mainRows.push(["Código raíz", item.part_number_root || "–"]);
+      mainRows.push(["Descripción", desc || "–"]);
+
+      // 👇 aquí preferimos supplier_name y dejamos los otros como fallback
+      const proveedor =
+        item.supplier_name ||
+        (item.supplier && item.supplier.name) ||
+        item.vendor_name ||
+        (item.catalog && item.catalog.supplier_name) ||
+        item.catalog_source ||
+        "–";
+
+      mainRows.push(["Proveedor", proveedor]);
+
+      const moneda = item.currency || "–";
+      const basePrice =
+        item.base_price !== undefined && item.base_price !== null
+          ? item.base_price.toFixed(2)
+          : "–";
+
+      mainRows.push(["Moneda base", moneda]);
+      mainRows.push(["Precio base", basePrice]);
+
+      if (item.min_qty_default !== undefined && item.min_qty_default !== null) {
+        mainRows.push(["Cantidad mínima por defecto", item.min_qty_default]);
+      }
+
+      let html = `
+        <h6 class="mb-2">Información general</h6>
+        <table class="table table-sm table-dark mb-3">
+          <tbody>
+            ${mainRows
+              .map(
+                ([label, value]) => `
+              <tr>
+                <th style="width:35%;">${escapeHtml(label)}</th>
+                <td>${escapeHtml(value)}</td>
+              </tr>
+            `
+              )
+              .join("")}
+          </tbody>
+        </table>
+      `;
+
+      const tiers = Array.isArray(item.price_tiers) ? item.price_tiers : [];
+      if (tiers.length) {
+        html += `
+          <h6 class="mb-2">Tramos de precio</h6>
+          <table class="table table-sm table-dark mb-3">
+            <thead>
+              <tr>
+                <th>Cant. mínima</th>
+                <th>Cant. máxima</th>
+                <th>Precio unitario</th>
+                <th>Moneda</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${tiers
+                .map((t) => {
+                  const minq = t.min_qty ?? "–";
+                  const maxq = t.max_qty ?? "–";
+                  const unitPrice =
+                    t.unit_price !== undefined && t.unit_price !== null
+                      ? t.unit_price.toFixed(2)
+                      : "–";
+                  const cur = t.currency || moneda || "–";
+                  return `
+                    <tr>
+                      <td>${escapeHtml(minq)}</td>
+                      <td>${escapeHtml(maxq)}</td>
+                      <td>${escapeHtml(unitPrice)}</td>
+                      <td>${escapeHtml(cur)}</td>
+                    </tr>
+                  `;
+                })
+                .join("")}
+            </tbody>
+          </table>
+        `;
+      }
+
+      const attrs =
+        item.attributes ||
+        item.extra_attributes ||
+        [];
+
+      if (Array.isArray(attrs) && attrs.length) {
+        html += `
+          <h6 class="mb-2">Información específica del catálogo</h6>
+          <table class="table table-sm table-dark mb-3">
+            <thead>
+              <tr>
+                <th>Atributo</th>
+                <th>Valor</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${attrs
+                .map((a) => {
+                  const name = a.attr_name || a.name || "–";
+                  const value = a.attr_value || a.value || "–";
+                  return `
+                    <tr>
+                      <td>${escapeHtml(name)}</td>
+                      <td>${escapeHtml(value)}</td>
+                    </tr>
+                  `;
+                })
+                .join("")}
+            </tbody>
+          </table>
+        `;
+      }
+
+      const usedKeys = new Set([
+        "part_number_full",
+        "part_number_root",
+        "description",
+        "currency",
+        "base_price",
+        "min_qty_default",
+        "supplier",
+        "supplier_name",   // 👈 añadimos supplier_name para que no salga en “Otros”
+        "vendor_name",
+        "catalog",
+        "catalogs",
+        "catalog_source",
+        "price_tiers",
+        "attributes",
+        "extra_attributes",
+      ]);
+
+      const otherRows = [];
+      for (const [key, val] of Object.entries(item)) {
+        if (usedKeys.has(key)) continue;
+        if (val === null || val === undefined) continue;
+        let display;
+        if (Array.isArray(val) || typeof val === "object") {
+          display = "[ver en JSON completo]";
+        } else {
+          display = String(val);
+        }
+        otherRows.push([formatLabel(key), display]);
+      }
+
+      if (otherRows.length) {
+        html += `
+          <h6 class="mb-2">Otros campos</h6>
+          <table class="table table-sm table-dark mb-1">
+            <tbody>
+              ${otherRows
+                .map(
+                  ([label, value]) => `
+                <tr>
+                  <th style="width:35%;">${escapeHtml(label)}</th>
+                  <td>${escapeHtml(value)}</td>
+                </tr>
+              `
+                )
+                .join("")}
+            </tbody>
+          </table>
+          <p class="small text-secondary">
+            Para más detalle de estos campos, abre el JSON completo al final.
+          </p>
+        `;
+      }
+
+      contentEl.innerHTML = html;
+
+      const modalEl = document.getElementById("detailModal");
+      const modal = bootstrap.Modal.getOrCreateInstance(modalEl);
+      modal.show();
+    }
+
+    // ----- Buscar repuestos -----
+    const searchForm = document.getElementById("searchForm");
+    const searchStatus = document.getElementById("searchStatus");
+    const resultsBody = document.getElementById("resultsBody");
+    const resultsCount = document.getElementById("resultsCount");
+
+    searchForm.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const query = document.getElementById("searchQuery").value.trim();
+      const vendor = document.getElementById("searchVendor").value.trim();
+      const currency = document.getElementById("searchCurrency").value;
+
+      if (!query) return;
+
+      searchStatus.textContent = "Buscando repuestos...";
+      resultsBody.innerHTML = `
+        <tr>
+          <td colspan="4" class="text-center text-secondary">
+            Cargando resultados...
+          </td>
+        </tr>
+      `;
+      resultsCount.textContent = "";
+
+      try {
+        const params = new URLSearchParams({ q: query });
+        if (vendor) params.append("vendor", vendor);
+        if (currency) params.append("currency", currency);
+
+        const resp = await fetch(`${API_BASE}/parts/search?` + params.toString());
+        if (!resp.ok) {
+          throw new Error("Error al consultar la API");
+        }
+
+        const data = await resp.json();
+        const results = Array.isArray(data) ? data : data.items || [];
+        lastResults = results;
+
+        if (!results.length) {
+          resultsBody.innerHTML = `
+            <tr>
+              <td colspan="4" class="text-center text-secondary">
+                No se encontraron repuestos para esta búsqueda.
+              </td>
+            </tr>
+          `;
+          resultsCount.textContent = "";
+          searchStatus.textContent = "Sin resultados.";
+          return;
+        }
+
+        resultsBody.innerHTML = "";
+        results.forEach((item, idx) => {
+          const codigo = item.part_number_full || item.part_number_root || "-";
+          const desc = item.description || "-";
+
+          // 👇 preferimos supplier_name, si viene del backend nuevo
+          const proveedor =
+            item.supplier_name ||
+            (item.supplier && item.supplier.name) ||
+            item.vendor_name ||
+            (item.catalog && item.catalog.supplier_name) ||
+            item.catalog_source ||
+            "-";
+
+          const tr = document.createElement("tr");
+          tr.innerHTML = `
+            <td><code>${codigo}</code></td>
+            <td>${desc}</td>
+            <td>${proveedor}</td>
+            <td>
+              <button type="button"
+                      class="btn btn-sm btn-outline-light"
+                      data-detail-index="${idx}">
+                Ver
+              </button>
+            </td>
+          `;
+          resultsBody.appendChild(tr);
+        });
+
+        document.querySelectorAll("button[data-detail-index]").forEach((btn) => {
+          btn.addEventListener("click", (ev) => {
+            const idx = parseInt(ev.currentTarget.getAttribute("data-detail-index"), 10);
+            showDetail(idx);
+          });
+        });
+
+        resultsCount.textContent = `${results.length} repuesto(s) encontrados.`;
+        searchStatus.textContent = "Búsqueda completada.";
+      } catch (err) {
+        console.error(err);
+        resultsBody.innerHTML = `
+          <tr>
+            <td colspan="4" class="text-center text-danger">
+              Ocurrió un error al buscar. Revisa que el backend esté levantado.
+            </td>
+          </tr>
+        `;
+        searchStatus.textContent = "Error al buscar repuestos.";
+      }
+    });
+
+    // ----- Subir catálogo -----
+    const uploadForm = document.getElementById("uploadForm");
+    const uploadStatus = document.getElementById("uploadStatus");
+
+    uploadForm.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const fileInput = document.getElementById("catalogFile");
+      const vendorInput = document.getElementById("catalogVendor");
+      const currencyInput = document.getElementById("catalogCurrency");
+
+      const file = fileInput.files[0];
+      if (!file) return;
+
+      const formData = new FormData();
+      formData.append("file", file);
+      formData.append("supplier_name", vendorInput.value);
+      formData.append("year", new Date().getFullYear());
+
+      uploadStatus.textContent = "Subiendo catálogo...";
+      uploadStatus.className = "mt-3 small text-secondary";
+
+      try {
+        const resp = await fetch(`${API_BASE}/catalogs/upload`, {
+          method: "POST",
+          body: formData,
+        });
+
+        if (!resp.ok) {
+          const errorText = await resp.text();
+          throw new Error(errorText || "Error al subir catálogo");
+        }
+
+        await resp.json().catch(() => ({}));
+
+        uploadStatus.textContent =
+          "Catálogo subido y procesado correctamente.";
+        uploadStatus.className = "mt-3 small text-success";
+
+        uploadForm.reset();
+      } catch (err) {
+        console.error(err);
+        uploadStatus.textContent =
+          "Error al subir catálogo. Revisa la consola o los logs del backend.";
+        uploadStatus.className = "mt-3 small text-danger";
+      }
+    });
+
+    // ----- “Stats” de demo -----
+    function setDemoStats() {
+      document.getElementById("statCatalogs").textContent = "5";
+      document.getElementById("statParts").textContent = "12.345";
+      document.getElementById("statUpdated").textContent =
+        new Date().toLocaleString();
+    }
+    setDemoStats();
+  </script>
+</body>
+</html>

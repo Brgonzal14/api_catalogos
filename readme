@@ -80,3 +80,18 @@ catalogos-api/
 ├─ requirements.txt  # Dependencias de Python
 ├─ Dockerfile        # Imagen de la API
 └─ docker-compose.yml# Orquestación de servicios (API + BD)
+
+
+
+Docker compose up
+
+cd app -frontend
+python -m http.server 5173
+
+
+
+# 1) Apagar contenedores y borrar volúmenes (incluye la BD)
+docker compose down -v
+
+# 2) Levantar todo de nuevo (recrea la BD vacía)
+docker compose up --build

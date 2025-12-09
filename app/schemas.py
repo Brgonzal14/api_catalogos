@@ -30,3 +30,16 @@ class PartOut(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class PartSearchOut(BaseModel):
+    id: int
+    part_number_full: str
+    description: str
+    supplier_name: str
+    currency: str
+    base_price: float
+    catalogs: List[str]  # nombres de los catálogos donde aparece
+
+    class Config:
+        orm_mode = True
