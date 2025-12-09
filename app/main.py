@@ -1,3 +1,4 @@
+## ⚙️ Configuración e Imports
 from fastapi import (
     FastAPI,
     UploadFile,
@@ -7,8 +8,12 @@ from fastapi import (
     Query,
     HTTPException,
 )
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import OperationalError
+from sqlalchemy import or_
 from typing import List, Dict, Tuple, Optional
+from contextlib import asynccontextmanager
 import os
 import io
 import time
@@ -18,13 +23,9 @@ import re
 import asyncio
 
 import pandas as pd
-from contextlib import asynccontextmanager
-from sqlalchemy.exc import OperationalError
-from sqlalchemy import or_
 
 from .db import Base, engine, get_db
 from . import models, schemas
-
 
 # ============================================================
 #  Lifespan: crear tablas al iniciar la app (con reintentos)
@@ -58,13 +59,23 @@ async def lifespan(app: FastAPI):
     print("[lifespan] Cerrando aplicación.")
 
 
+## 🚀 Inicialización de la App
 app = FastAPI(title="API Catálogos Aeronáuticos", lifespan=lifespan)
 
+# --- CORS para permitir el front independiente ---
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],       # para demo lo dejamos abierto
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ============================================================
 #  Helpers de BD
 # ============================================================
 def get_or_create_supplier(db: Session, name: str) -> models.Supplier:
+    """Busca un proveedor por nombre o lo crea si no existe."""
     supplier = db.query(models.Supplier).filter(models.Supplier.name == name).first()
     if supplier:
         return supplier
@@ -76,6 +87,7 @@ def get_or_create_supplier(db: Session, name: str) -> models.Supplier:
 
 
 def create_catalog(db: Session, supplier: models.Supplier, year: int, filename: str) -> models.Catalog:
+    """Crea una nueva entrada de catálogo."""
     catalog = models.Catalog(
         supplier_id=supplier.id,
         year=year,
@@ -88,6 +100,7 @@ def create_catalog(db: Session, supplier: models.Supplier, year: int, filename: 
 
 
 def normalize_part_number(code: str) -> Tuple[str, str]:
+    """Normaliza el código de parte y extrae la raíz."""
     if code is None:
         return "", ""
     code = code.strip()
@@ -95,70 +108,9 @@ def normalize_part_number(code: str) -> Tuple[str, str]:
     return code, root
 
 
-def read_xlsx_fallback(xlsx_bytes: bytes) -> pd.DataFrame:
-    """
-    Lector de respaldo para archivos .xlsx que openpyxl no puede abrir
-    (por XML inválido).
-    Lee directamente xl/worksheets/sheet1.xml y xl/sharedStrings.xml.
-    """
-    z = zipfile.ZipFile(io.BytesIO(xlsx_bytes))
-    ns = {"x": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
-
-    # ----- sharedStrings (texto compartido) -----
-    shared_strings: List[str] = []
-    try:
-        shared_root = ET.fromstring(z.read("xl/sharedStrings.xml"))
-        for si in shared_root.findall("x:si", ns):
-            t_el = si.find("x:t", ns)
-            if t_el is not None:
-                # texto simple
-                shared_strings.append(t_el.text or "")
-            else:
-                # texto compuesto por varios <r><t>
-                text = ""
-                for r in si.findall("x:r", ns):
-                    t = r.find("x:t", ns)
-                    if t is not None and t.text:
-                        text += t.text
-                shared_strings.append(text)
-    except KeyError:
-        # libro sin sharedStrings.xml
-        shared_strings = []
-
-    # ----- sheet1.xml -----
-    sheet_xml = z.read("xl/worksheets/sheet1.xml")
-    root = ET.fromstring(sheet_xml)
-
-    rows_data: List[List[Optional[str]]] = []
-
-    for row in root.findall("x:sheetData/x:row", ns):
-        row_list: List[Optional[str]] = []
-        for c in row.findall("x:c", ns):
-            t = c.get("t")  # tipo de celda
-            v_el = c.find("x:v", ns)
-            if v_el is None:
-                val = None
-            else:
-                v = v_el.text
-                if t == "s" and v is not None:
-                    # índice en sharedStrings
-                    idx = int(v)
-                    val = shared_strings[idx] if 0 <= idx < len(shared_strings) else None
-                else:
-                    val = v
-            row_list.append(val)
-        rows_data.append(row_list)
-
-    if not rows_data:
-        return pd.DataFrame()
-
-    # Igualamos el largo de todas las filas
-    max_len = max(len(r) for r in rows_data)
-    norm_rows = [r + [None] * (max_len - len(r)) for r in rows_data]
-
-    return pd.DataFrame(norm_rows)
-
-
+# ============================================================
+#  Helpers de Lectura de Archivos
+# ============================================================
 def read_xlsx_fallback(xlsx_bytes: bytes) -> pd.DataFrame:
     """
     Lector de respaldo para archivos .xlsx que openpyxl no puede abrir
@@ -227,9 +179,6 @@ def read_pdf_tables(pdf_bytes: bytes) -> pd.DataFrame:
     """
     Lee todas las tablas de un PDF (caso STUKERJURGEN Hansair)
     y las concatena en un solo DataFrame bruto.
-
-    Requiere instalar pdfplumber:
-        pip install pdfplumber
     """
     try:
         import pdfplumber
@@ -353,15 +302,8 @@ def parse_qty_range(text: str) -> Tuple[Optional[int], Optional[int]]:
 
 def detect_header_and_qty_ranges(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, str]]:
     """
-    Detecta:
-    - fila de encabezados (buscando 'part number', 'description' o 'item ...')
-    - fila inmediatamente debajo con los rangos '25-99', '100-249', etc.
-      y construye nombres de columnas únicos tipo:
-      'Qty/ea 25-99', 'Qty/ea 100-249', ...
-
-    Devuelve:
-      - df recortado solo a las filas de datos
-      - dict {nombre_columna_lowercase: texto_rango}
+    Detecta la fila de encabezados y rangos de cantidad.
+    Ajusta el DataFrame para que solo contenga datos y actualiza las columnas.
     """
     header_row_idx = None
     for i, row in df.head(40).iterrows():
@@ -374,12 +316,13 @@ def detect_header_and_qty_ranges(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[s
             break
 
     qty_ranges_by_col_lower: Dict[str, str] = {}
+    start_data_idx = 0
+    col_names: List[str] = []
 
     if header_row_idx is not None:
         header_row = df.iloc[header_row_idx]
         next_row = df.iloc[header_row_idx + 1] if header_row_idx + 1 < len(df) else None
 
-        col_names: List[str] = []
         for idx, val in enumerate(header_row):
             raw_name = str(val).strip() if val is not None else ""
             if not raw_name:
@@ -506,53 +449,33 @@ async def upload_catalog(
         # ===============================
         column_map = {
             # códigos de pieza
-            "part number": "part_number",
-            "part_number": "part_number",
-            "part numbep": "part_number",
-            "pn": "part_number",
-            "p/n": "part_number",
-            "part-no.": "part_number",
-            "part-no": "part_number",
-            "part no.": "part_number",
+            "part number": "part_number", "part_number": "part_number", "part numbep": "part_number",
+            "pn": "part_number", "p/n": "part_number", "part-no.": "part_number",
+            "part-no": "part_number", "part no.": "part_number",
 
             # Article / ArticleNo
-            "articleno.": "article_no",
-            "article no.": "article_no",
-            "article no": "article_no",
+            "articleno.": "article_no", "article no.": "article_no", "article no": "article_no",
 
             # columnas ITEM (AIRTEC-BRAIDS)
-            "item (standard)": "part_number",
-            "item (other)": "part_number",
-            "item": "part_number",
+            "item (standard)": "part_number", "item (other)": "part_number", "item": "part_number",
 
             # descripción
-            "descripcion": "description",
-            "description": "description",
+            "descripcion": "description", "description": "description",
 
             # precio
-            "price": "price",
-            "precio": "price",
-            "master $": "price",  # catálogos tipo Master $
+            "price": "price", "precio": "price", "master $": "price",
 
             # moneda
-            "currency": "currency",
-            "moneda": "currency",
+            "currency": "currency", "moneda": "currency",
 
             # cantidades mínimas / máximas
-            "min qty": "min_qty",
-            "min_qty": "min_qty",
-            "from qty": "min_qty",
-            "to qty": "max_qty",
-            "max qty": "max_qty",
-            "quantity": "min_qty",
-            "qty": "min_qty",
+            "min qty": "min_qty", "min_qty": "min_qty", "from qty": "min_qty",
+            "to qty": "max_qty", "max qty": "max_qty",
+            "quantity": "min_qty", "qty": "min_qty",
 
             # otros posibles
-            "unit code": "unit_code",
-            "unit": "unit_code",
-            "lead time": "lead_time",
-            "lifecycle": "lifecycle",
-            "cumulative": "cumulative",
+            "unit code": "unit_code", "unit": "unit_code", "lead time": "lead_time",
+            "lifecycle": "lifecycle", "cumulative": "cumulative",
         }
 
         normalized_cols: Dict[str, str] = {}
@@ -560,11 +483,11 @@ async def upload_catalog(
             raw_name = str(col).strip()
             col_key = raw_name.lower()
 
-            # 1) Primero, si hay mapeo exacto en column_map, usamos ese
+            # 1) Mapeo exacto
             if col_key in column_map:
                 mapped = column_map[col_key]
 
-            # 2) PANASONIC Master Price List: columnas tipo "Master S2 2023", "Master S2 2024", etc.
+            # 2) PANASONIC Master Price List: columnas tipo "Master S2 2023", etc.
             elif "master" in col_key and ("s2" in col_key or "$" in col_key):
                 mapped = "price"
 
@@ -579,11 +502,9 @@ async def upload_catalog(
 
             normalized_cols[col] = mapped
 
-
         df.rename(columns=normalized_cols, inplace=True)
 
         # 3.1 Para catálogos tipo STUKERJURGEN:
-        #     ArticleNo = código principal, Part-No. = código del fabricante
         if "article_no" in df.columns:
             if "part_number" in df.columns:
                 df["supplier_part_no"] = df["part_number"]
@@ -625,7 +546,7 @@ async def upload_catalog(
                     raw_code = c
                     break
 
-            # Si esta fila no trae código (ArticleNo en blanco), usamos el último
+            # Si esta fila no trae código, usamos el último
             if (raw_code is None or str(raw_code).strip() == "") and last_part_code is not None:
                 raw_code = last_part_code
 
@@ -635,12 +556,11 @@ async def upload_catalog(
 
             part_number_full, part_number_root = normalize_part_number(str(raw_code))
 
-            # Si el "código" no tiene ningún dígito (p.ej. 'ArticleNo.' de la cabecera),
-            # lo interpretamos como fila de encabezado y la ignoramos.
+            # Si el "código" no tiene ningún dígito (fila de encabezado), ignorar
             if not any(ch.isdigit() for ch in part_number_root):
                 continue
 
-            # Guardamos el último código visto para las siguientes filas sin ArticleNo
+            # Guardamos el último código visto
             last_part_code = raw_code
 
             # ---------- DESCRIPCIÓN ----------
@@ -666,7 +586,6 @@ async def upload_catalog(
             min_qty_default = 1
             if min_qty is not None and str(min_qty) != "nan":
                 s_min = str(min_qty).strip()
-                # buscamos el primer número entero que aparezca en el texto
                 m_qty = re.search(r"\d+", s_min)
                 if m_qty:
                     min_qty_default = int(m_qty.group(0))
@@ -776,13 +695,8 @@ async def upload_catalog(
             # --------- ATRIBUTOS EXTRA ---------
             if is_new_part:
                 standard = {
-                    "part_number",
-                    "article_no",
-                    "description",
-                    "price",
-                    "currency",
-                    "min_qty",
-                    "max_qty",
+                    "part_number", "article_no", "description", "price",
+                    "currency", "min_qty", "max_qty",
                 }
                 for col_name, value in row.items():
                     norm_name = normalized_cols.get(
@@ -812,15 +726,20 @@ async def upload_catalog(
 # ============================================================
 @app.get("/parts/search", response_model=List[schemas.PartOut])
 def search_parts(
-    query: str = Query(..., min_length=1, description="Código o parte de la descripción"),
+    query: str = Query(
+        ...,
+        alias="q",
+        min_length=1,
+        description="Código o parte de la descripción",
+    ),
     db: Session = Depends(get_db),
 ):
     q = query.strip()
     if not q:
         return []
 
-    like_prefix = f"{q}%"    # empieza con lo que escribes
-    like_any = f"%{q}%"      # contiene lo que escribes
+    like_prefix = f"{q}%"
+    like_any = f"%{q}%"
 
     parts = (
         db.query(models.Part)
