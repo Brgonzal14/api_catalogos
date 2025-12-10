@@ -22,7 +22,7 @@ import zipfile
 import xml.etree.ElementTree as ET
 import re
 import asyncio
-
+from datetime import datetime
 import pandas as pd
 
 from .db import Base, engine, get_db
@@ -930,6 +930,25 @@ async def upload_catalog(
     return {
         "message": f"Catálogo cargado (piezas únicas insertadas: {inserted})",
         "catalog_id": catalog.id,
+    }
+# ============================================================
+#  Endpoint: estadísticas simples (/stats)
+# ============================================================
+@app.get("/stats")
+def get_stats(db: Session = Depends(get_db)):
+    """
+    Devuelve:
+      - cantidad de catálogos cargados
+      - cantidad de repuestos en BD
+      - timestamp de generación
+    """
+    catalogs_count = db.query(models.Catalog).count()
+    parts_count = db.query(models.Part).count()
+
+    return {
+        "catalogs": catalogs_count,
+        "parts": parts_count,
+        "generated_at": datetime.utcnow().isoformat() + "Z",
     }
 
 
