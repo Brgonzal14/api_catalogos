@@ -43,7 +43,11 @@ class Part(Base):
     catalog = relationship("Catalog", back_populates="parts")
     price_tiers = relationship("PriceTier", back_populates="part")
     attributes = relationship("PartAttribute", back_populates="part")
-
+    aliases = relationship(
+        "PartAlias",
+        back_populates="part",
+        cascade="all, delete-orphan",
+    )
 
 class PriceTier(Base):
     __tablename__ = "price_tiers"
@@ -67,3 +71,13 @@ class PartAttribute(Base):
     attr_value = Column(String)
 
     part = relationship("Part", back_populates="attributes")
+
+class PartAlias(Base):
+    __tablename__ = "part_aliases"
+
+    id = Column(Integer, primary_key=True, index=True)
+    part_id = Column(Integer, ForeignKey("parts.id"), index=True, nullable=False)
+    code = Column(String, index=True, nullable=False)
+    source = Column(String)  # p.ej. "HOLMCO_END_UNIT"
+
+    part = relationship("Part", back_populates="aliases")

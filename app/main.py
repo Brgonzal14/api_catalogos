@@ -354,6 +354,200 @@ def detect_header_and_qty_ranges(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[s
 
     return df, qty_ranges_by_col_lower
 
+# ============================================================
+#  Helpers específicos HOLMCO
+# ============================================================
+def parse_holmco_end_unit(raw: Optional[str]) -> List[str]:
+    """
+    Recibe algo como:
+      '1046GT2102XX (91-06-05362)'
+      '89-01-07XXX, 89-01-(X)-12, 89-01-(X)-16, 89-01-(X)-18'
+    y devuelve:
+      ['1046GT2102XX', '91-06-05362']
+      ['89-01-07XXX', '89-01-(X)-12', '89-01-(X)-16', '89-01-(X)-18']
+    """
+    if not raw:
+        return []
+
+    # separar por coma o salto de línea
+    tokens = re.split(r"[,\\n]+", str(raw))
+    codes: List[str] = []
+
+    for t in tokens:
+        t = t.strip()
+        if not t:
+            continue
+
+        # Caso "1046GT2102XX (91-06-05362)"
+        m = re.match(r"^\s*([^\s(]+)\s*\(([^)]+)\)\s*$", t)
+        if m:
+            codes.append(m.group(1).strip())
+            codes.append(m.group(2).strip())
+        else:
+            # Caso "89-01-07XXX" o "89-01-(X)-16"
+            codes.append(t)
+
+    # quitar duplicados manteniendo el orden
+    seen = set()
+    out: List[str] = []
+    for c in codes:
+        if c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out
+
+def import_holmco_price_list(
+    file_bytes: bytes,
+    db: Session,
+    supplier: models.Supplier,
+    catalog: models.Catalog,
+    default_currency: str,
+) -> int:
+    """
+    Importa 'HOLMCO Price_List_2023_Issue1_Nov22 - USD.xlsx'.
+    Por cada PART NUMBER crea:
+      - Part (con precio base y min_qty_default = PRICE BREAK)
+      - PriceTier
+      - PartAlias para todos los códigos de END-UNIT
+      - PartAttribute con todas las columnas extra.
+    """
+    # leer sin encabezado para encontrar la fila de PART NUMBER
+    df_raw = pd.read_excel(io.BytesIO(file_bytes), sheet_name=0, header=None)
+
+    header_idx = None
+    for i, row in df_raw.iterrows():
+        for cell in row:
+            if isinstance(cell, str) and "part number" in cell.lower():
+                header_idx = i
+                break
+        if header_idx is not None:
+            break
+
+    if header_idx is None:
+        raise HTTPException(
+            status_code=400,
+            detail="No se encontró la fila de encabezados (PART NUMBER) en el catálogo HOLMCO.",
+        )
+
+    # Volver a leer usando esa fila como encabezado
+    df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=0, header=header_idx)
+
+    # Mapear nombres de columnas
+    col_map: Dict[str, str] = {}
+    for col in df.columns:
+        name = str(col).strip()
+        lower = name.lower()
+
+        if "part number" in lower:
+            col_map[col] = "part_number"
+        elif "description" in lower:
+            col_map[col] = "description"
+        elif "end-unit" in lower or "end unit" in lower:
+            col_map[col] = "end_unit"
+        elif "price usd" in lower or ("price" in lower and "usd" in lower):
+            col_map[col] = "price_usd"
+        elif "price break" in lower:
+            col_map[col] = "price_break_pcs"
+        elif "package" in lower and "qty" in lower:
+            col_map[col] = "package_qty"
+        elif "remark" in lower:
+            col_map[col] = "remark"
+        elif "lead time" in lower:
+            col_map[col] = "lead_time"
+
+    df = df.rename(columns=col_map)
+
+    if "part_number" not in df.columns:
+        raise HTTPException(
+            status_code=400,
+            detail="No se encontró la columna PART NUMBER en el catálogo HOLMCO.",
+        )
+
+    # Nos quedamos solo con filas que tienen PART NUMBER
+    df = df[df["part_number"].notna()]
+    df = df.where(pd.notnull(df), None)
+
+    inserted = 0
+
+    for _, row in df.iterrows():
+        raw_code = row.get("part_number")
+        if not raw_code:
+            continue
+
+        part_number_full, part_number_root = normalize_part_number(str(raw_code))
+
+        description_val = row.get("description") or ""
+        description = str(description_val).strip()
+
+        end_unit_raw = row.get("end_unit") or ""
+
+        # PRECIO
+        price = parse_price_value(row.get("price_usd"))
+
+        # PRICE BREAK -> min_qty_default
+        price_break_val = row.get("price_break_pcs")
+        min_qty_default = 1
+        if price_break_val is not None:
+            try:
+                min_qty_default = int(str(price_break_val).strip())
+            except ValueError:
+                m = re.search(r"\d+", str(price_break_val))
+                if m:
+                    min_qty_default = int(m.group(0))
+
+        # Crear Part
+        part = models.Part(
+            catalog_id=catalog.id,
+            supplier_id=supplier.id,
+            part_number_full=part_number_full,
+            part_number_root=part_number_root,
+            description=description,
+            currency=default_currency,
+            base_price=price,
+            min_qty_default=min_qty_default,
+        )
+        db.add(part)
+        db.flush()  # para obtener part.id
+        inserted += 1
+
+        # PriceTier
+        if price is not None:
+            pt = models.PriceTier(
+                part_id=part.id,
+                min_qty=min_qty_default,
+                max_qty=None,
+                unit_price=price,
+                currency=default_currency,
+            )
+            db.add(pt)
+
+        # Alias desde END-UNIT
+        alias_codes = parse_holmco_end_unit(end_unit_raw)
+        for code in alias_codes:
+            db.add(
+                models.PartAlias(
+                    part_id=part.id,
+                    code=code,
+                    source="HOLMCO_END_UNIT",
+                )
+            )
+
+        # Atributos extra: guardamos TODAS las columnas para este partnumber
+        extra_cols = ["end_unit", "price_break_pcs", "package_qty", "remark", "lead_time"]
+        for col_name in extra_cols:
+            val = row.get(col_name)
+            if val is None:
+                continue
+            attr = models.PartAttribute(
+                part_id=part.id,
+                attr_name=col_name,
+                attr_value=str(val),
+            )
+            db.add(attr)
+
+    db.commit()
+    return inserted
+
 
 # ============================================================
 #  Endpoint: subir catálogo (multi-hoja, Excel/CSV/PDF)
@@ -370,6 +564,23 @@ async def upload_catalog(
 
     # moneda por defecto deducida del nombre del archivo
     default_currency = "EUR" if "eur" in file.filename.lower() else "USD"
+
+    if "holmco" in supplier_name.lower() or "holmco" in file.filename.lower():
+        supplier = get_or_create_supplier(db, supplier_name)
+        catalog = create_catalog(db, supplier, year, file.filename)
+
+        inserted = import_holmco_price_list(
+            file_bytes=content,
+            db=db,
+            supplier=supplier,
+            catalog=catalog,
+            default_currency=default_currency,
+        )
+
+        return {
+            "message": f"Catálogo HOLMCO cargado (piezas únicas insertadas: {inserted})",
+            "catalog_id": catalog.id,
+        }
 
     # ===============================
     # 1) LEER TODAS LAS HOJAS / TABLAS EN DATAFRAMES
@@ -759,6 +970,7 @@ def search_parts(
     )
 
     results = []
+    seen_parts = set()
 
     for part, supplier in rows:
         # Convertimos el objeto SQLAlchemy a un dict “plano”
@@ -772,7 +984,6 @@ def search_parts(
             "min_qty_default": part.min_qty_default,
             "catalog_id": part.catalog_id,
             "supplier_id": part.supplier_id,
-            # 👇 ESTE es el campo que usará el front
             "supplier_name": supplier.name,
             # relaciones
             "price_tiers": [

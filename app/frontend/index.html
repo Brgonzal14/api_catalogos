@@ -9,50 +9,174 @@
     href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css"
     rel="stylesheet"
   />
-  <style>
-    body {
-      background: #0f172a;
-      color: #e5e7eb;
-    }
-    .navbar {
-      background: #020617;
-    }
-    .card {
-      background: #020617;
-      border: 1px solid #1f2937;
-    }
-    .form-control,
-    .form-select {
-      background: #020617;
-      color: #e5e7eb;
-      border-color: #1f2937;
-    }
-    .form-control:focus,
-    .form-select:focus {
-      box-shadow: none;
-      border-color: #3b82f6;
-    }
-    .btn-primary {
-      background: #3b82f6;
-      border-color: #3b82f6;
-    }
-    .badge-pill {
-      border-radius: 999px;
-    }
-    .table-dark {
-      --bs-table-bg: #020617;
-      --bs-table-striped-bg: #020617;
-      --bs-table-striped-color: #e5e7eb;
-    }
-    .tab-btn.active {
-      background: #111827 !important;
-      color: #e5e7eb !important;
-    }
-    .small-label {
-      font-size: 0.8rem;
-      color: #9ca3af;
-    }
-  </style>
+<style>
+  :root {
+    --hansair-blue: #004a80;         /* header / botones principales   */
+    --hansair-blue-dark: #00345a;    /* hover                         */
+    --hansair-blue-light: #e5eff7;   /* fondos suaves / stripes       */
+    --hansair-yellow: #ffc800;       /* acentos (opcional)            */
+    --hansair-bg: #f5f5f5;           /* fondo general                 */
+    --hansair-card-bg: #ffffff;      /* tarjetas / tablas             */
+    --hansair-border: #d1d5db;       /* bordes suaves                 */
+    --hansair-text-main: #111827;    /* texto principal (casi negro)  */
+    --hansair-text-muted: #6b7280;   /* texto secundario              */
+  }
+
+  body {
+    background: var(--hansair-bg);
+    color: var(--hansair-text-main);
+  }
+
+  .navbar {
+    background: var(--hansair-blue);
+    border-bottom: 2px solid #ffffff;
+  }
+
+  .navbar-brand,
+  .navbar .navbar-text {
+    color: #ffffff !important;
+  }
+
+  .brand-logo {
+    height: 28px;
+  }
+
+  .card {
+    background: var(--hansair-card-bg);
+    border: 1px solid var(--hansair-border);
+    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.08);
+    color: var(--hansair-text-main);
+  }
+
+  .text-secondary {
+    color: var(--hansair-text-muted) !important;
+  }
+
+  .small-label {
+    font-size: 0.8rem;
+    color: var(--hansair-text-muted);
+    letter-spacing: 0.02em;
+  }
+
+  /* Inputs y selects */
+  .form-control,
+  .form-select {
+    background: #ffffff;
+    color: var(--hansair-text-main);
+    border-color: var(--hansair-border);
+  }
+
+  .form-control:focus,
+  .form-select:focus {
+    box-shadow: 0 0 0 0.15rem rgba(0, 74, 128, 0.35);
+    border-color: var(--hansair-blue);
+    background: #ffffff;
+    color: var(--hansair-text-main);
+  }
+
+  .form-control::placeholder {
+    color: #9ca3af;
+    opacity: 1;
+  }
+
+  /* Botones */
+  .btn-primary {
+    background: var(--hansair-blue);
+    border-color: var(--hansair-blue);
+    color: #ffffff;
+    font-weight: 600;
+  }
+
+  .btn-primary:hover {
+    background: var(--hansair-blue-dark);
+    border-color: var(--hansair-blue-dark);
+  }
+
+  .btn-outline-light {
+    border-color: var(--hansair-blue);
+    color: var(--hansair-blue);
+    background: transparent;
+    font-weight: 500;
+  }
+
+  .btn-outline-light:hover {
+    background: var(--hansair-blue);
+    color: #ffffff;
+  }
+
+  .badge-pill {
+    border-radius: 999px;
+  }
+
+  /* Tabs */
+  .tab-btn {
+    border-color: var(--hansair-border);
+    color: var(--hansair-text-main);
+    background: #ffffff;
+  }
+
+  .tab-btn.active {
+    background: var(--hansair-blue) !important;
+    color: #ffffff !important;
+    border-color: var(--hansair-blue) !important;
+  }
+
+/* Tabla */
+.table-dark {
+  --bs-table-bg: #ffffff;
+  --bs-table-striped-bg: var(--hansair-blue-light);
+  --bs-table-striped-color: var(--hansair-text-main);
+  --bs-table-border-color: var(--hansair-border);
+  --bs-table-color: var(--hansair-text-main);   /* 👈 clave: texto oscuro */
+}
+
+/* encabezado con fondo azul y texto blanco */
+.table-dark thead th {
+  background: var(--hansair-blue);
+  color: #ffffff;
+  border-bottom-color: var(--hansair-blue-dark);
+}
+
+/* cuerpo de la tabla: texto oscuro siempre */
+.table-dark tbody td,
+.table-dark tbody th {
+  color: var(--hansair-text-main);
+}
+
+.table-dark tbody tr:hover {
+  background-color: #dde8f3;
+}
+
+
+  /* Modal */
+  .modal-content {
+    background: #ffffff;
+    color: var(--hansair-text-main);
+    border: 1px solid var(--hansair-border);
+  }
+
+  .modal-header,
+  .modal-footer {
+    border-color: var(--hansair-border);
+  }
+
+  .btn-close.btn-close-white {
+    filter: invert(0); /* como el fondo es blanco, usamos el close normal */
+  }
+
+  details summary {
+    cursor: pointer;
+  }
+
+  code {
+    background: var(--hansair-blue-light);
+    color: var(--hansair-blue-dark);
+    padding: 0.1rem 0.35rem;
+    border-radius: 999px;
+    font-size: 0.85em;
+  }
+</style>
+
 </head>
 <body>
   <!-- NAVBAR -->
