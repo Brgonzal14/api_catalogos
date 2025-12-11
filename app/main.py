@@ -955,6 +955,9 @@ def get_stats(db: Session = Depends(get_db)):
 # ============================================================
 #  Endpoint: búsqueda de piezas (incluye nombre del proveedor)
 # ============================================================
+# ============================================================
+#  Endpoint: búsqueda de piezas (incluye nombre del proveedor)
+# ============================================================
 @app.get("/parts/search")
 def search_parts(
     query: str = Query(
@@ -972,15 +975,23 @@ def search_parts(
     like_prefix = f"{q}%"
     like_any = f"%{q}%"
 
-    # Hacemos JOIN con Supplier para obtener el nombre del proveedor
+    # JOIN con Supplier y OUTER JOIN con PartAttribute
     rows = (
         db.query(models.Part, models.Supplier)
         .join(models.Supplier, models.Part.supplier_id == models.Supplier.id)
+        .outerjoin(
+            models.PartAttribute,
+            models.PartAttribute.part_id == models.Part.id,
+        )
         .filter(
             or_(
+                # códigos principales
                 models.Part.part_number_full.ilike(like_prefix),
                 models.Part.part_number_root.ilike(like_prefix),
+                # descripción
                 models.Part.description.ilike(like_any),
+                # 🔹 ahora también busca en TODOS los atributos
+                models.PartAttribute.attr_value.ilike(like_any),
             )
         )
         .order_by(models.Part.part_number_full)
@@ -989,10 +1000,13 @@ def search_parts(
     )
 
     results = []
-    seen_parts = set()
+    seen_parts = set()  # para evitar duplicados por el JOIN con atributos
 
     for part, supplier in rows:
-        # Convertimos el objeto SQLAlchemy a un dict “plano”
+        if part.id in seen_parts:
+            continue
+        seen_parts.add(part.id)
+
         item = {
             "id": part.id,
             "part_number_full": part.part_number_full,
@@ -1004,7 +1018,6 @@ def search_parts(
             "catalog_id": part.catalog_id,
             "supplier_id": part.supplier_id,
             "supplier_name": supplier.name,
-            # relaciones
             "price_tiers": [
                 {
                     "id": pt.id,
