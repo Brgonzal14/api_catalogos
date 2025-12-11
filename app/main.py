@@ -550,6 +550,249 @@ def import_holmco_price_list(
 
 
 # ============================================================
+#  Helpers específicos para GMI AERO (Final Boss)
+# ============================================================
+
+def clean_gmi_price(value):
+    """
+    Parsea precios formato europeo donde el punto es mil y la coma es decimal.
+    Ej: "1.210" -> 1210.0 | "50,4" -> 50.4 | "95" -> 95.0
+    """
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s or s.lower() == "nan":
+        return None
+    
+    # Eliminar símbolos de moneda
+    s = s.replace("€", "").replace("$", "").strip()
+    
+    # Lógica específica GMI: si hay punto y NO hay coma, asume punto = miles
+    # Ej: 3.000 -> 3000
+    if "." in s and "," not in s:
+        # Verifica si parece miles (3 dígitos tras el punto)
+        parts = s.split(".")
+        if len(parts) > 1 and len(parts[-1]) == 3:
+            s = s.replace(".", "") # 1.210 -> 1210
+        else:
+            pass # 1.5 -> 1.5 (poco probable en este catálogo para enteros, pero posible)
+
+    # Si hay coma, reemplazar por punto para float de python
+    s = s.replace(",", ".") 
+    
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+def process_gmi_sheet(
+    db: Session,
+    catalog: models.Catalog,
+    supplier: models.Supplier,
+    df_raw: pd.DataFrame,
+    sheet_name: str,
+    default_currency: str
+) -> int:
+    """
+    Procesa una hoja de GMI detectando múltiples tablas lado a lado.
+    Retorna la cantidad de partes insertadas.
+    """
+    inserted_count = 0
+    
+    # 1. Buscar la fila de encabezados (contiene "P/N")
+    header_row_idx = None
+    for i, row in df_raw.head(20).iterrows():
+        # Convertimos a string toda la fila y buscamos P/N
+        row_str = " ".join([str(x).lower() for x in row.values])
+        if "p/n" in row_str and ("price" in row_str or "precio" in row_str or "desc" in row_str):
+            header_row_idx = i
+            break
+            
+    if header_row_idx is None:
+        return 0 # No se encontró tabla en esta hoja
+
+    # 2. Analizar esa fila para ver cuántas tablas hay (detectando columnas P/N)
+    header_row = df_raw.iloc[header_row_idx]
+    
+    # Índices de columnas donde empieza una tabla (donde dice "P/N")
+    table_start_indices = []
+    for col_idx, cell_val in enumerate(header_row):
+        val_str = str(cell_val).strip().lower()
+        if val_str in ["p/n", "pn", "part number"]:
+            table_start_indices.append(col_idx)
+    
+    if not table_start_indices:
+        return 0
+
+    # 3. Procesar cada "sub-tabla" detectada
+    # Los datos empiezan una fila después del header
+    data_df = df_raw.iloc[header_row_idx + 1:].reset_index(drop=True)
+
+    for start_idx in table_start_indices:
+        # Definimos el fin de esta sub-tabla (hasta el próximo P/N o fin de columnas)
+        # Buscamos el siguiente start_idx que sea mayor al actual
+        next_indices = [x for x in table_start_indices if x > start_idx]
+        end_idx = next_indices[0] if next_indices else len(df_raw.columns)
+        
+        # Cortamos el DataFrame verticalmente
+        sub_df = data_df.iloc[:, start_idx:end_idx].copy()
+        
+        # Asignamos nombres de columnas basados en el header original
+        # Tomamos los nombres del header_row original para este rango
+        col_names = []
+        for c in range(start_idx, end_idx):
+            col_name = str(header_row.iloc[c]).strip()
+            # Manejo de columnas duplicadas o vacías en pandas
+            if not col_name or col_name == "nan": 
+                col_name = f"col_{c}"
+            col_names.append(col_name)
+        
+        sub_df.columns = col_names
+        sub_df = sub_df.dropna(how="all") # Borrar filas totalmente vacías
+
+        # 4. Mapeo de columnas GMI a nuestro modelo
+        # Normalizamos nombres para encontrar precio y descripción
+        final_cols = {}
+        found_price_customer = False
+        
+        for col in sub_df.columns:
+            cl = col.lower()
+            if cl in ["p/n", "pn"]:
+                final_cols[col] = "part_number"
+            elif "descr" in cl or "descprition" in cl: # Typo detectado en tu imagen "Descprition"
+                final_cols[col] = "description"
+            elif "customer" in cl and "price" in cl:
+                final_cols[col] = "price_customer"
+                found_price_customer = True
+            elif "representative" in cl and "price" in cl:
+                final_cols[col] = "price_rep"
+            elif "diameter" in cl:
+                final_cols[col] = "attr_diameter"
+            elif "to connect" in cl:
+                final_cols[col] = "attr_connect"
+            elif "lenght" in cl or "length" in cl:
+                final_cols[col] = "attr_length"
+        
+        sub_df.rename(columns=final_cols, inplace=True)
+        
+        if "part_number" not in sub_df.columns:
+            continue
+
+        # 5. Iterar filas e insertar
+        for _, row in sub_df.iterrows():
+            pn = row.get("part_number")
+            if pd.isna(pn) or str(pn).strip() == "":
+                continue
+            
+            # Normalizar PN
+            full_pn = str(pn).strip()
+            root_pn = full_pn.split("-")[0]
+            
+            # Descripción
+            desc = row.get("description")
+            if pd.isna(desc): desc = ""
+            
+            # Precios: Prioridad Customer (suele ser el PVP), si no Rep
+            # Nota: GMI usa formato 1.200 (mil doscientos) o 95 (noventa y cinco)
+            p_cust = clean_gmi_price(row.get("price_customer"))
+            p_rep = clean_gmi_price(row.get("price_rep"))
+            
+            base_price = p_cust if p_cust is not None else p_rep
+            
+            # Crear Part
+            part = models.Part(
+                catalog_id=catalog.id,
+                supplier_id=supplier.id,
+                part_number_full=full_pn,
+                part_number_root=root_pn,
+                description=str(desc),
+                currency=default_currency,
+                base_price=base_price,
+                min_qty_default=1
+            )
+            db.add(part)
+            db.flush() # para tener ID
+            
+            inserted_count += 1
+            
+            # Price Tier (tramo base)
+            if base_price:
+                pt = models.PriceTier(
+                    part_id=part.id,
+                    min_qty=1,
+                    unit_price=base_price,
+                    currency=default_currency
+                )
+                db.add(pt)
+            
+            # ATRIBUTO CLAVE: Nombre de la hoja (Sección del catálogo)
+            # Esto cumple tu requerimiento de "saber a qué hoja pertenece"
+            db.add(models.PartAttribute(
+                part_id=part.id, 
+                attr_name="Catálogo Sección", 
+                attr_value=sheet_name
+            ))
+            
+            # Guardar precio Representative como atributo si existe
+            if p_rep is not None:
+                 db.add(models.PartAttribute(
+                    part_id=part.id, 
+                    attr_name="Precio Representative", 
+                    attr_value=str(p_rep)
+                ))
+
+            # Otros atributos (Diameter, Length, etc.)
+            for k, v in row.items():
+                if k.startswith("attr_") and pd.notna(v):
+                    clean_name = k.replace("attr_", "").capitalize()
+                    db.add(models.PartAttribute(
+                        part_id=part.id, 
+                        attr_name=clean_name, 
+                        attr_value=str(v)
+                    ))
+
+    return inserted_count
+
+def import_gmi_catalog(
+    file_bytes: bytes,
+    db: Session,
+    supplier: models.Supplier,
+    catalog: models.Catalog,
+    default_currency: str
+) -> int:
+    """
+    Manejador principal para el Excel de GMI.
+    """
+    # Leer todas las hojas
+    try:
+        # Usamos openpyxl para obtener nombres de hojas primero
+        xl = pd.ExcelFile(io.BytesIO(file_bytes), engine='openpyxl')
+    except Exception:
+        # Fallback a lectura simple si falla
+        xl = pd.ExcelFile(io.BytesIO(file_bytes))
+        
+    total_inserted = 0
+    
+    for sheet_name in xl.sheet_names:
+        # 1. Omitir hojas "basura" (Read Me, Terms)
+        sn_lower = sheet_name.lower()
+        if "read me" in sn_lower or "terms" in sn_lower or "cover" in sn_lower:
+            continue
+            
+        # Leer la hoja completa sin header (header=None) para buscar manualmente
+        df_raw = xl.parse(sheet_name, header=None)
+        
+        if df_raw.empty:
+            continue
+            
+        # Procesar hoja
+        count = process_gmi_sheet(db, catalog, supplier, df_raw, sheet_name, default_currency)
+        total_inserted += count
+        
+    db.commit()
+    return total_inserted
+
+# ============================================================
 #  Endpoint: subir catálogo (multi-hoja, Excel/CSV/PDF)
 # ============================================================
 @app.post("/catalogs/upload")
@@ -579,6 +822,23 @@ async def upload_catalog(
 
         return {
             "message": f"Catálogo HOLMCO cargado (piezas únicas insertadas: {inserted})",
+            "catalog_id": catalog.id,
+        }
+        # --- NUEVO BLOQUE GMI AERO ---
+    if "gmi" in supplier_name.lower() or "gmi" in file.filename.lower():
+        supplier = get_or_create_supplier(db, supplier_name)
+        catalog = create_catalog(db, supplier, year, file.filename)
+
+        inserted = import_gmi_catalog(
+            file_bytes=content,
+            db=db,
+            supplier=supplier,
+            catalog=catalog,
+            default_currency=default_currency,
+        )
+
+        return {
+            "message": f"Catálogo GMI procesado. Hojas escaneadas. (Piezas insertadas: {inserted})",
             "catalog_id": catalog.id,
         }
 
