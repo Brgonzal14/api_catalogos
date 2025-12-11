@@ -1040,3 +1040,57 @@ def search_parts(
         results.append(item)
 
     return results
+
+@app.get("/catalogs", response_model=List[schemas.CatalogListOut])
+def list_catalogs(db: Session = Depends(get_db)):
+    """
+    Lista todos los catálogos ordenados por fecha de creación (más recientes primero).
+    Incluye el nombre del proveedor haciendo un JOIN implícito o explícito.
+    """
+    # Obtenemos catálogos y cargamos la relación con Supplier
+    catalogs = (
+        db.query(models.Catalog)
+        .join(models.Supplier)
+        .order_by(models.Catalog.created_at.desc())
+        .all()
+    )
+    
+    # Formateamos la respuesta para que coincida con el esquema
+    results = []
+    for cat in catalogs:
+        results.append({
+            "id": cat.id,
+            "supplier_name": cat.supplier.name,  # Accedemos a la relación
+            "year": cat.year,
+            "original_filename": cat.original_filename,
+            "created_at": cat.created_at
+        })
+    
+    return results
+
+# ... imports existentes ...
+
+@app.get("/catalogs", response_model=List[schemas.CatalogListOut])
+def list_catalogs(db: Session = Depends(get_db)):
+    """
+    Devuelve la lista de catálogos con el nombre de su proveedor.
+    """
+    catalogs = (
+        db.query(models.Catalog)
+        .join(models.Supplier)
+        .order_by(models.Catalog.created_at.desc())
+        .all()
+    )
+    
+    # Transformamos los datos para que coincidan con el esquema
+    results = []
+    for cat in catalogs:
+        results.append({
+            "id": cat.id,
+            "supplier_name": cat.supplier.name,
+            "year": cat.year,
+            "original_filename": cat.original_filename,
+            "created_at": cat.created_at
+        })
+    
+    return results

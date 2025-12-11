@@ -4,7 +4,6 @@
   <meta charset="UTF-8" />
   <title>Catálogos de Repuestos - Demo</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <!-- Bootstrap -->
   <link
     href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css"
     rel="stylesheet"
@@ -179,10 +178,8 @@
 
 </head>
 <body>
-  <!-- NAVBAR -->
-<nav class="navbar navbar-dark mb-4">
+  <nav class="navbar navbar-dark mb-4">
   <div class="container d-flex justify-content-between align-items-center">
-    <!-- Logo Hansair a la izquierda -->
     <a class="navbar-brand m-0" href="#">
       <img
         src="logo.svg"            
@@ -191,7 +188,6 @@
       />
     </a>
 
-    <!-- Texto a la derecha -->
     <span class="navbar-text small text-light">
       FastAPI + Base de datos
     </span>
@@ -199,7 +195,6 @@
 </nav>
 
   <div class="container mb-5">
-    <!-- HEADER / RESUMEN -->
     <div class="row g-3 mb-4">
       <div class="col-md-8">
         <div class="card h-100">
@@ -223,7 +218,6 @@
         </div>
       </div>
 
-      <!-- “Métricas” / estado (demo) -->
       <div class="col-md-4">
         <div class="card h-100">
           <div class="card-body">
@@ -245,7 +239,6 @@
       </div>
     </div>
 
-    <!-- TABS -->
     <div class="mb-3">
       <div class="btn-group" role="group">
         <button
@@ -258,6 +251,14 @@
         <button
           type="button"
           class="btn btn-outline-light tab-btn"
+          data-target="#tab-catalogs"
+          id="btn-tab-catalogs"
+        >
+          📋 Ver Catálogos
+        </button>
+        <button
+          type="button"
+          class="btn btn-outline-light tab-btn"
           data-target="#tab-upload"
         >
           📤 Cargar catálogo
@@ -265,9 +266,7 @@
       </div>
     </div>
 
-    <!-- TAB: BUSCAR -->
     <div id="tab-search" class="tab-content-section">
-      <!-- BUSCADOR -->
       <div class="card mb-3">
         <div class="card-body">
           <h5 class="card-title mb-3">Buscar repuestos</h5>
@@ -309,7 +308,6 @@
         </div>
       </div>
 
-      <!-- RESULTADOS -->
       <div class="card">
         <div class="card-body">
           <h6 class="mb-3 text-secondary">Resultados</h6>
@@ -337,7 +335,40 @@
       </div>
     </div>
 
-    <!-- TAB: UPLOAD -->
+    <div id="tab-catalogs" class="tab-content-section" style="display: none;">
+      <div class="card">
+        <div class="card-body">
+          <div class="d-flex justify-content-between align-items-center mb-3">
+            <h5 class="card-title m-0">Catálogos en el sistema</h5>
+            <button class="btn btn-sm btn-outline-primary" onclick="loadCatalogs()">
+              🔄 Refrescar
+            </button>
+          </div>
+          
+          <div class="table-responsive">
+            <table class="table table-dark table-striped align-middle">
+              <thead>
+                <tr>
+                  <th>ID</th>
+                  <th>Proveedor</th>
+                  <th>Año</th>
+                  <th>Archivo Original</th>
+                  <th>Fecha de Carga</th>
+                </tr>
+              </thead>
+              <tbody id="catalogsBody">
+                <tr>
+                  <td colspan="5" class="text-center text-secondary">
+                    Cargando lista...
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <div id="tab-upload" class="tab-content-section" style="display: none;">
       <div class="card">
         <div class="card-body">
@@ -395,7 +426,6 @@
     </div>
   </div>
 
-  <!-- MODAL DETALLE AMIGABLE -->
   <div class="modal fade" id="detailModal" tabindex="-1" aria-hidden="true">
     <div class="modal-dialog modal-lg modal-dialog-scrollable">
       <div class="modal-content" style="background:#020617;color:#e5e7eb;">
@@ -408,12 +438,10 @@
             Aquí se muestra toda la información del producto de forma resumida y entendible.
           </p>
 
-          <!-- Contenido amigable -->
           <div id="detailContent"></div>
 
           <hr class="border-secondary my-3" />
 
-          <!-- JSON crudo, solo si alguien quiere verlo -->
           <details class="small text-secondary">
             <summary>Ver JSON completo (modo desarrollador)</summary>
             <pre id="detailJsonRaw" style="background:#020617;border-radius:0.5rem;padding:1rem;font-size:0.8rem;max-height:40vh;overflow:auto;"></pre>
@@ -426,7 +454,6 @@
     </div>
   </div>
 
-  <!-- Bootstrap JS -->
   <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 
   <script>
@@ -804,6 +831,10 @@
         uploadStatus.className = "mt-3 small text-success";
 
         uploadForm.reset();
+        
+        // Refrescamos los stats y si estamos en la pestaña de catálogos, también la lista
+        loadStats();
+        loadCatalogs(); 
       } catch (err) {
         console.error(err);
         uploadStatus.textContent =
@@ -811,6 +842,65 @@
         uploadStatus.className = "mt-3 small text-danger";
       }
     });
+
+    // ----- Cargar lista de catálogos (NUEVA FUNCIÓN) -----
+    async function loadCatalogs() {
+      const tbody = document.getElementById("catalogsBody");
+      // Si no existe la tabla (por alguna razón), salimos
+      if (!tbody) return;
+
+      tbody.innerHTML = `
+        <tr><td colspan="5" class="text-center text-secondary">Cargando...</td></tr>
+      `;
+
+      try {
+        const resp = await fetch(`${API_BASE}/catalogs`);
+        if (!resp.ok) throw new Error("Error al obtener catálogos");
+        
+        const data = await resp.json();
+        
+        if (!Array.isArray(data) || data.length === 0) {
+          tbody.innerHTML = `
+            <tr><td colspan="5" class="text-center text-secondary">No hay catálogos subidos aún.</td></tr>
+          `;
+          return;
+        }
+
+        tbody.innerHTML = "";
+        data.forEach(cat => {
+          // Formatear fecha simple
+          let dateStr = "–";
+          if (cat.created_at) {
+            const dateObj = new Date(cat.created_at);
+            dateStr = dateObj.toLocaleString("es-CL");
+          }
+
+          const tr = document.createElement("tr");
+          tr.innerHTML = `
+            <td>${cat.id}</td>
+            <td class="fw-bold text-primary">${cat.supplier_name || '–'}</td>
+            <td>${cat.year}</td>
+            <td><code>${cat.original_filename}</code></td>
+            <td class="small">${dateStr}</td>
+          `;
+          tbody.appendChild(tr);
+        });
+        
+      } catch (err) {
+        console.error(err);
+        tbody.innerHTML = `
+          <tr><td colspan="5" class="text-center text-danger">Error al cargar la lista.</td></tr>
+        `;
+      }
+    }
+
+    // Listener para el botón de la pestaña
+    const btnCatalogs = document.getElementById("btn-tab-catalogs");
+    if (btnCatalogs) {
+      btnCatalogs.addEventListener("click", () => {
+        loadCatalogs();
+      });
+    }
 
     // ----- Stats reales desde el backend (/stats) -----
     async function loadStats() {
@@ -842,6 +932,7 @@
       }
     }
 
+    // Carga inicial
     loadStats();
 
   </script>

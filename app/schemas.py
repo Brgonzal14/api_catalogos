@@ -1,5 +1,6 @@
 from typing import List, Optional
 from pydantic import BaseModel
+from datetime import datetime 
 
 class PriceTierBase(BaseModel):
     min_qty: int
@@ -43,3 +44,14 @@ class PartSearchOut(BaseModel):
 
     class Config:
         orm_mode = True
+
+
+class CatalogListOut(BaseModel):
+    id: int
+    supplier_name: str
+    year: int
+    original_filename: str
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
