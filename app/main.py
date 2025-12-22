@@ -27,6 +27,11 @@ import pandas as pd
 
 from .db import Base, engine, get_db
 from . import models, schemas
+import os
+from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+
 
 # ============================================================
 #  Lifespan: crear tablas al iniciar la app (con reintentos)
@@ -63,14 +68,31 @@ async def lifespan(app: FastAPI):
 ## 🚀 Inicialización de la App
 app = FastAPI(title="API Catálogos Aeronáuticos", lifespan=lifespan)
 
-# --- CORS para permitir el front independiente ---
+# =========================
+# Frontend estático
+# =========================
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+
+# --- CORS para permitir el front independiente 
 app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],       # para demo lo dejamos abierto
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+     CORSMiddleware,
+     allow_origins=["*"],       # para demo lo dejamos abierto
+     allow_credentials=True,
+     allow_methods=["*"],
+     allow_headers=["*"],
+ ) 
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+FRONTEND_DIR = os.path.join(BASE_DIR, "frontend")
+
+app.mount("/static", StaticFiles(directory=FRONTEND_DIR), name="static")
+
+@app.get("/", include_in_schema=False)
+def read_frontend():
+    return FileResponse(os.path.join(FRONTEND_DIR, "index.html"))
+
+
 
 # ============================================================
 #  Helpers de BD
@@ -1466,29 +1488,3 @@ def list_catalogs(db: Session = Depends(get_db)):
     
     return results
 
-# ... imports existentes ...
-
-@app.get("/catalogs", response_model=List[schemas.CatalogListOut])
-def list_catalogs(db: Session = Depends(get_db)):
-    """
-    Devuelve la lista de catálogos con el nombre de su proveedor.
-    """
-    catalogs = (
-        db.query(models.Catalog)
-        .join(models.Supplier)
-        .order_by(models.Catalog.created_at.desc())
-        .all()
-    )
-    
-    # Transformamos los datos para que coincidan con el esquema
-    results = []
-    for cat in catalogs:
-        results.append({
-            "id": cat.id,
-            "supplier_name": cat.supplier.name,
-            "year": cat.year,
-            "original_filename": cat.original_filename,
-            "created_at": cat.created_at
-        })
-    
-    return results
