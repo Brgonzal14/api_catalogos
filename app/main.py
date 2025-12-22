@@ -550,118 +550,175 @@ def import_holmco_price_list(
 
 
 # ============================================================
-#  Helpers GMI AERO V2 (Final Boss Solved)
+#  Helpers GMI AERO V2 (Corregido y Limpio)
 # ============================================================
 
 def clean_gmi_price(value):
+    """Limpia y convierte precios, manejando nulos y texto."""
     if value is None:
         return None
     s = str(value).strip()
     if not s or s.lower() == "nan":
         return None
     
-    # Caso especial GMI: "check first", "on request", etc.
-    if any(x in s.lower() for x in ["check", "request", "call"]):
+    # Caso especial GMI: ignorar textos que no son precios
+    if any(x in s.lower() for x in ["check", "request", "call", "specify"]):
         return None
 
-    # Limpieza básica
+    # Limpieza de moneda
     s = s.replace("€", "").replace("$", "").strip()
     
-    # Manejo 1.200 (mil) vs 1,2 (decimal)
-    if "." in s and "," not in s:
-        parts = s.split(".")
-        if len(parts) > 1 and len(parts[-1]) == 3:
-            s = s.replace(".", "")
-    
-    s = s.replace(",", ".") 
-    
+    # Manejo de formato europeo (1.200,00 -> 1200.00) vs US (1,200.00 -> 1200.00)
+    # Si hay punto y coma, asumimos que la coma es decimal si está al final
+    if "." in s and "," in s:
+        last_dot = s.rfind(".")
+        last_comma = s.rfind(",")
+        if last_comma > last_dot: # Formato 1.500,00
+            s = s.replace(".", "").replace(",", ".")
+        else: # Formato 1,500.00
+            s = s.replace(",", "")
+    elif "," in s:
+        # Solo comas: si parece decimal (2 decimales al final), reemplazar por punto
+        # Si es 1,200 se asume mil.
+        parts = s.split(",")
+        if len(parts[-1]) == 2: # probable decimal "12,50"
+             s = s.replace(",", ".")
+        else:
+             s = s.replace(",", "")
+             
     try:
         return float(s)
     except ValueError:
         return None
 
+def clean_gmi_part_number(value):
+    """
+    SOLUCIÓN PROBLEMA MISC:
+    Elimina comillas, saltos de línea y espacios ocultos que corrompen la búsqueda.
+    """
+    if pd.isna(value):
+        return None
+    s = str(value)
+    
+    # 1. Eliminar comillas simples y dobles (causa del problema GMISAP021)
+    s = s.replace('"', '').replace("'", "")
+    
+    # 2. Eliminar saltos de línea y retornos de carro
+    s = s.replace('\n', '').replace('\r', '')
+    
+    # 3. Eliminar espacios duros (non-breaking space) y tabulaciones
+    s = s.replace('\xa0', '').replace('\t', '')
+    
+    # 4. Trim final
+    s = s.strip()
+    
+    if not s or s.lower() in ["nan", "n/a", "null"]:
+        return None
+        
+    return s
+
 def extract_gmi_parts_from_row(row, map_config, sheet_name, current_section, catalog_id, supplier_id, default_currency):
     """
-    Extrae uno o más Partes de una sola fila basada en una configuración de columnas.
-    Maneja 'OR' y saltos de línea.
+    Extrae partes de una fila limpiando rigurosamente los códigos.
+    Además:
+      - Adjunta atributos extra (CM/Zones/etc.)
+      - Devuelve ambos precios (Customer/Representative) si existen
     """
     parts_found = []
-    
-    # Obtener valor crudo del P/N
-    raw_pn = row[map_config['pn_idx']] if map_config['pn_idx'] < len(row) else None
-    
-    if pd.isna(raw_pn): 
-        return []
-    
-    s_pn = str(raw_pn).strip()
-    
-    # Filtros de basura
-    if not s_pn or s_pn.lower() in ["nan", "n/a", "p/n", "part number", "item", "description"]:
-        return []
-    
-    # Si el PN parece un título de sección (muy largo y con espacios, sin números a veces), lo ignoramos como parte
-    # (El loop principal ya debería haber detectado esto como cambio de sección, pero por seguridad)
-    if len(s_pn) > 20 and " " in s_pn and not any(char.isdigit() for char in s_pn):
+
+    idx = map_config.get("pn_idx")
+    if idx is None or idx >= len(row):
         return []
 
-    # Lógica de separación (Splitting)
-    # 1. Separar por saltos de línea
-    candidates = s_pn.replace("\r", "\n").split("\n")
-    
+    raw_pn = row[idx]
+    s_pn = clean_gmi_part_number(raw_pn)
+
+    if not s_pn:
+        return []
+
+    if s_pn.lower() in ["p/n", "pn", "part number", "item", "model", "description"]:
+        return []
+
+    if len(s_pn) > 25 and " " in s_pn and not any(c.isdigit() for c in s_pn):
+        return []
+
+    # Split por saltos de línea / "or"
+    original_str = str(raw_pn).replace("\r", "\n")
+    candidates = original_str.split("\n")
+
     final_pns = []
     for c in candidates:
-        c = c.strip()
-        if not c: continue
-        
-        # 2. Separar por " or " (Caso Tooling)
-        if " or " in c.lower():
-            sub_parts = c.lower().split(" or ")
-            final_pns.extend([sp.strip().upper() for sp in sub_parts])
+        clean_c = clean_gmi_part_number(c)
+        if not clean_c:
+            continue
+
+        if " or " in clean_c.lower():
+            for sp in re.split(r"\bor\b", clean_c, flags=re.IGNORECASE):
+                sp = sp.strip(" ,;")
+                if sp:
+                    final_pns.append(clean_gmi_part_number(sp.upper()))
         else:
-            final_pns.append(c)
-            
-    # Procesar cada PN extraído
+            final_pns.append(clean_c)
+
+    # Precios
+    p_cust = None
+    if map_config.get("price_cust_idx") is not None and map_config["price_cust_idx"] < len(row):
+        p_cust = clean_gmi_price(row[map_config["price_cust_idx"]])
+
+    p_rep = None
+    if map_config.get("price_rep_idx") is not None and map_config["price_rep_idx"] < len(row):
+        p_rep = clean_gmi_price(row[map_config["price_rep_idx"]])
+
+    base_price = p_cust if p_cust is not None else p_rep
+
+    # Descripción
+    desc = ""
+    if map_config.get("desc_idx") is not None and map_config["desc_idx"] < len(row):
+        d_val = row[map_config["desc_idx"]]
+        if pd.notna(d_val):
+            desc = str(d_val).strip().replace("\n", " ")
+
+    # Atributos extra (CM/Zones/etc.)
+    extra_attributes = []
+    for col_idx, label in map_config.get("extra_desc_idxs", []):
+        if col_idx < len(row):
+            v = row[col_idx]
+            if pd.notna(v):
+                vv = str(v).strip()
+                if vv and vv.lower() != "nan":
+                    lab = str(label).replace("\n", " ").strip()
+                    name = lab.upper() if lab.lower() in ["cm", "mm"] else lab.title()
+                    extra_attributes.append({"name": name, "value": vv})
+
+    # Guardar ambos precios como atributos (para que el front los muestre sí o sí)
+    if p_cust is not None:
+        extra_attributes.append({"name": "Unit Price (Customer)", "value": str(p_cust)})
+    if p_rep is not None:
+        extra_attributes.append({"name": "Unit Price (Representative)", "value": str(p_rep)})
+
     for pn in final_pns:
-        # Limpieza final del PN (quitar paréntesis tipo "(120V)")
+        if not pn:
+            continue
+
         if "(" in pn:
             pn = pn.split("(")[0].strip()
-            
-        if not pn or pn.lower() == "n/a": continue
 
-        # Extraer descripción y precio
-        desc = ""
-        if map_config.get('desc_idx') is not None and map_config['desc_idx'] < len(row):
-            d_val = row[map_config['desc_idx']]
-            if pd.notna(d_val): desc = str(d_val).strip()
-
-        # Precios
-        p_cust = None
-        if map_config.get('price_cust_idx') is not None and map_config['price_cust_idx'] < len(row):
-            p_cust = clean_gmi_price(row[map_config['price_cust_idx']])
-            
-        p_rep = None
-        if map_config.get('price_rep_idx') is not None and map_config['price_rep_idx'] < len(row):
-            p_rep = clean_gmi_price(row[map_config['price_rep_idx']])
-
-        base_price = p_cust if p_cust is not None else p_rep
-
-        # Crear objeto dict para ser insertado (o modelo)
-        part_obj = {
+        parts_found.append({
             "catalog_id": catalog_id,
             "supplier_id": supplier_id,
             "part_number_full": pn,
-            "part_number_root": pn.split("-")[0], # Simple root logic
+            "part_number_root": pn.split("-")[0],
             "description": desc,
             "currency": default_currency,
             "base_price": base_price,
-            "min_qty_default": 1,
             "section": current_section,
             "sheet": sheet_name,
-            "price_rep": p_rep
-        }
-        parts_found.append(part_obj)
-        
+            "price_rep": p_rep,
+            "extra_attributes": extra_attributes,
+        })
+
     return parts_found
+
 
 def process_gmi_sheet_v2(
     db: Session,
@@ -671,125 +728,184 @@ def process_gmi_sheet_v2(
     sheet_name: str,
     default_currency: str
 ) -> int:
-    """
-    Escanea la hoja fila por fila.
-    - Detecta filas de encabezado (que contienen "P/N") para reconfigurar columnas.
-    - Soporta múltiples tablas en paralelo (side-by-side).
-    """
     inserted_count = 0
-    active_maps = [] # Lista de configs: [{'pn_idx': 0, 'desc_idx': 1, ...}, ...]
-    current_section = sheet_name # Por defecto, el nombre de la hoja
-    
-    # Convertimos a lista de listas para iteración rápida y segura
+    active_maps = []
+    current_section = sheet_name
+
+    # Convertimos todo a lista de listas para máxima velocidad
     rows = df_raw.values.tolist()
     
+    # Palabras clave para detectar headers explícitos
+    header_keywords = ["p/n", "pn", "part number", "part_number", "model"]
+
+    def _auto_discover_map(row_data, pn_col_idx):
+        """
+        PLAN B: Si encontramos un código GMI pero no tenemos mapa para esa columna,
+        deducimos dónde están el precio y la descripción analizando los tipos de datos de la fila.
+        """
+        map_cfg = {"pn_idx": pn_col_idx, "extra_desc_idxs": []}
+        
+        # 1. Buscar Descripción (Texto largo a la derecha)
+        # 2. Buscar Precio (Número o moneda a la derecha)
+        limit_search = min(len(row_data), pn_col_idx + 8) # Mirar hasta 8 columnas adelante
+        
+        prices_found = []
+        desc_found = None
+        
+        for i in range(pn_col_idx + 1, limit_search):
+            val = row_data[i]
+            val_clean = str(val).strip()
+            if not val_clean or val_clean.lower() == "nan":
+                continue
+                
+            # ¿Es Precio?
+            price_candidate = clean_gmi_price(val)
+            if price_candidate is not None:
+                prices_found.append(i)
+                continue
+                
+            # ¿Es Descripción? (Texto largo, no numérico, no fecha)
+            # Evitamos celdas cortas que puedan ser unidades ("EA", "m")
+            if len(val_clean) > 3 and desc_found is None:
+                desc_found = i
+            elif any(x in val_clean.lower() for x in ["cm", "mm", "diam", "zone", "size"]):
+                # Atributos tipo "Dimensions"
+                map_cfg["extra_desc_idxs"].append((i, "Attr"))
+
+        # Asignar lo encontrado
+        if desc_found is not None:
+            map_cfg["desc_idx"] = desc_found
+        
+        if prices_found:
+            map_cfg["price_cust_idx"] = prices_found[0] # El primero suele ser Customer
+            if len(prices_found) > 1:
+                map_cfg["price_rep_idx"] = prices_found[1] # El segundo Representative
+
+        # 3. Buscar Atributos a la IZQUIERDA (ID, Item en Consumables)
+        # Miramos 2 columnas atrás
+        start_left = max(0, pn_col_idx - 2)
+        for i in range(start_left, pn_col_idx):
+            val = row_data[i]
+            if val and str(val).strip() and str(val).lower() != "nan":
+                # Si hay algo escrito a la izquierda, lo agregamos como "Info"
+                map_cfg["extra_desc_idxs"].insert(0, (i, "Info"))
+
+        return map_cfg
+
     for row_idx, row in enumerate(rows):
-        # 1. Análisis de la fila para ver si es un ENCABEZADO
-        # Convertimos a string lower para buscar
         row_str_list = [str(c).strip().lower() for c in row]
         
-        # Buscamos índices donde aparece "p/n" o "part number"
-        pn_indices = [i for i, val in enumerate(row_str_list) if val in ["p/n", "pn", "part number"]]
-        
-        if pn_indices:
-            # ¡Nueva configuración de tabla detectada!
-            # Esto maneja el caso "Blankets" (tablas lado a lado) y "Misc/Tooling" (tablas apiladas)
-            new_maps = []
-            
-            for start_idx in pn_indices:
-                # Buscar columnas relativas a este P/N
-                map_cfg = {'pn_idx': start_idx}
-                
-                # Buscamos description y prices a la derecha de este PN, 
-                # DETENIENDONOS si encontramos otro PN (para no invadir la siguiente tabla lateral)
-                next_pn_idx = 9999
-                for other_idx in pn_indices:
-                    if other_idx > start_idx:
-                        next_pn_idx = min(next_pn_idx, other_idx)
-                        
-                limit_idx = min(len(row), next_pn_idx)
-                
-                for i in range(start_idx + 1, limit_idx):
-                    val = row_str_list[i]
-                    if "desc" in val: # description, descprition, etc.
-                        map_cfg['desc_idx'] = i
-                    elif "customer" in val and "price" not in map_cfg: # Prioridad 1
-                        map_cfg['price_cust_idx'] = i
-                    elif "representative" in val:
-                        map_cfg['price_rep_idx'] = i
-                    elif ("unit price" in val or "price" in val) and "price_cust_idx" not in map_cfg:
-                        # Fallback si no dice explícitamente customer
-                        map_cfg['price_cust_idx'] = i
-                        
-                new_maps.append(map_cfg)
-            
-            # Actualizamos los mapas activos y saltamos esta fila (es header)
-            active_maps = new_maps
-            continue
-            
-        # 2. Si no es encabezado, ¿es un cambio de SECCIÓN (Título)?
-        # Criterio: Columna 0 tiene texto, no hay precios, y no estamos parseando nada útil
-        # Esto arregla "Toolings" pasando a "Leslie"
-        first_col = str(row[0]).strip()
-        if first_col and len(first_col) > 3 and active_maps:
-            # Chequeamos si la celda 0 coincide con el PN de la tabla activa
-            # Si no parece un PN (tiene espacios, sin numeros, palabras clave), es sección
-            is_header_text = False
-            if " " in first_col and not any(c.isdigit() for c in first_col):
-                is_header_text = True
-            
-            if is_header_text:
-                current_section = first_col
-                # No 'continue' aquí, porque a veces el título está en la misma línea que datos (raro pero posible)
-                # Pero en GMI suelen ser filas separadas. Asumamos que si es título, no es dato.
-                # Salvo que sea un PN muy raro.
-                # Mejor dejamos que el extractor decida si es PN válido.
+        # --- PASO 1: Análisis de Datos (Data Scan) ---
+        # Identificamos qué columnas tienen códigos GMI válidos en esta fila
+        gmi_cols_indices = []
+        for i, val in enumerate(row):
+            val_clean = clean_gmi_part_number(val)
+            if val_clean and str(val_clean).upper().startswith("GMI"):
+                gmi_cols_indices.append(i)
 
-        # 3. Extracción de datos usando los mapas activos
-        if not active_maps:
-            continue
+        # --- PASO 2: Gestión de Mapas (Header Detection & Fusion) ---
+        # Si NO hay datos GMI, buscamos headers para preparar las siguientes filas
+        if not gmi_cols_indices:
+            pn_indices = [i for i, val in enumerate(row_str_list) if val in header_keywords]
+            if pn_indices:
+                # Detectamos nuevos headers
+                new_maps = []
+                for start_idx in pn_indices:
+                    # Lógica estándar de mapeo por headers (como en versiones anteriores)
+                    map_cfg = {"pn_idx": start_idx, "extra_desc_idxs": []}
+                    
+                    # Límite derecho para no invadir
+                    next_pn = 9999
+                    for other in pn_indices: 
+                        if other > start_idx: next_pn = min(next_pn, other)
+                    limit = min(len(row), next_pn)
+                    
+                    # Buscar columnas por nombre
+                    unit_cols = []
+                    for i in range(start_idx + 1, limit):
+                        v = row_str_list[i]
+                        if "desc" in v: map_cfg["desc_idx"] = i
+                        if any(k in v for k in ["cm", "dim", "zone", "size", "diam"]):
+                            map_cfg["extra_desc_idxs"].append((i, v.title()))
+                        if "customer" in v: map_cfg["price_cust_idx"] = i
+                        if "representative" in v: map_cfg["price_rep_idx"] = i
+                        if "price" in v or "unit" in v or "€" in v: unit_cols.append(i)
+                    
+                    # Fallback precios
+                    if "price_cust_idx" not in map_cfg and unit_cols: map_cfg["price_cust_idx"] = unit_cols[0]
+                    if "price_rep_idx" not in map_cfg and len(unit_cols) > 1: map_cfg["price_rep_idx"] = unit_cols[1]
+                    
+                    # Mirar izquierda (ID, Type)
+                    l_limit = 0
+                    for other in pn_indices: 
+                        if other < start_idx: l_limit = max(l_limit, other+1)
+                    for i in range(l_limit, start_idx):
+                        if row_str_list[i] in ["id", "type", "category"]:
+                            map_cfg["extra_desc_idxs"].insert(0, (i, row_str_list[i].title()))
+                            
+                    new_maps.append(map_cfg)
+                
+                # Reemplazamos mapas activos si es una fila puramente de encabezados
+                active_maps = new_maps
+            continue # Saltamos fila de solo headers
+
+        # --- PASO 3: Extracción y Auto-Descubrimiento (La Magia) ---
+        # Iteramos sobre las columnas donde ENCONTRAMOS datos GMI
+        for gmi_col in gmi_cols_indices:
             
-        for map_config in active_maps:
+            # A) ¿Tenemos un mapa activo para esta columna?
+            current_map = next((m for m in active_maps if m["pn_idx"] == gmi_col), None)
+            
+            # B) Si NO tenemos mapa (tabla nueva sin header, o header perdido), ¡LO CREAMOS!
+            if not current_map:
+                # 
+                current_map = _auto_discover_map(row, gmi_col)
+                # Lo agregamos a activos para que sirva para las siguientes filas también
+                active_maps.append(current_map)
+
+            # C) Extraer datos usando el mapa (existente o descubierto)
+            # Usamos una sección genérica si no hay título detectado
             parts = extract_gmi_parts_from_row(
-                row, map_config, sheet_name, current_section, 
+                row, current_map, sheet_name, current_section,
                 catalog.id, supplier.id, default_currency
             )
             
             for p_data in parts:
-                # Insertar en BD
                 part = models.Part(
-                    catalog_id=p_data['catalog_id'],
-                    supplier_id=p_data['supplier_id'],
-                    part_number_full=p_data['part_number_full'],
-                    part_number_root=p_data['part_number_root'],
-                    description=p_data['description'],
-                    currency=p_data['currency'],
-                    base_price=p_data['base_price'],
+                    catalog_id=p_data["catalog_id"],
+                    supplier_id=p_data["supplier_id"],
+                    part_number_full=p_data["part_number_full"],
+                    part_number_root=p_data["part_number_root"],
+                    description=p_data["description"],
+                    currency=p_data["currency"],
+                    base_price=p_data["base_price"],
                     min_qty_default=1
                 )
                 db.add(part)
                 db.flush()
                 inserted_count += 1
                 
-                # Precio Tier Base
-                if p_data['base_price']:
-                    pt = models.PriceTier(
-                        part_id=part.id,
-                        min_qty=1,
-                        unit_price=p_data['base_price'],
-                        currency=p_data['currency']
-                    )
-                    db.add(pt)
+                if p_data["base_price"] is not None:
+                    db.add(models.PriceTier(
+                        part_id=part.id, min_qty=1,
+                        unit_price=p_data["base_price"], currency=p_data["currency"]
+                    ))
                 
-                # Atributos de Trazabilidad
-                db.add(models.PartAttribute(part_id=part.id, attr_name="Sección", attr_value=p_data['section']))
-                db.add(models.PartAttribute(part_id=part.id, attr_name="Hoja Original", attr_value=p_data['sheet']))
-                
-                if p_data['price_rep']:
-                    db.add(models.PartAttribute(part_id=part.id, attr_name="Precio Representative", attr_value=str(p_data['price_rep'])))
+                # Atributos
+                db.add(models.PartAttribute(part_id=part.id, attr_name="Sección", attr_value=p_data["section"]))
+                db.add(models.PartAttribute(part_id=part.id, attr_name="Hoja Original", attr_value=p_data["sheet"]))
+                for a in p_data.get("extra_attributes", []):
+                    db.add(models.PartAttribute(part_id=part.id, attr_name=a["name"], attr_value=a["value"]))
+        
+        # --- PASO 4: Detectar Títulos de Sección (Opcional) ---
+        # Si la fila tiene texto en col 0 pero NO es GMI, podría ser un título nuevo
+        if 0 not in gmi_cols_indices and isinstance(row[0], str):
+            clean_txt = str(row[0]).strip()
+            # Si es texto largo y no es header
+            if len(clean_txt) > 3 and clean_txt.lower() not in header_keywords:
+                 current_section = clean_txt
 
     return inserted_count
-
 def import_gmi_catalog(
     file_bytes: bytes,
     db: Session,
@@ -1237,11 +1353,6 @@ def get_stats(db: Session = Depends(get_db)):
         "parts": parts_count,
         "generated_at": datetime.utcnow().isoformat() + "Z",
     }
-
-
-# ============================================================
-#  Endpoint: búsqueda de piezas (incluye nombre del proveedor)
-# ============================================================
 # ============================================================
 #  Endpoint: búsqueda de piezas (incluye nombre del proveedor)
 # ============================================================
