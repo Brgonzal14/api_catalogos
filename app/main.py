@@ -1378,22 +1378,48 @@ def get_stats(db: Session = Depends(get_db)):
 # ============================================================
 #  Endpoint: búsqueda de piezas (incluye nombre del proveedor)
 # ============================================================
+import re
+from sqlalchemy import or_
+
 @app.get("/parts/search")
 def search_parts(
     query: str = Query(
         ...,
         alias="q",  # ?q= en la URL
         min_length=1,
-        description="Código o parte de la descripción",
+        description="Código o parte de la descripción (puede ser múltiple separado por coma o líneas)",
     ),
     db: Session = Depends(get_db),
 ):
-    q = query.strip()
-    if not q:
+    raw = (query or "").strip()
+    if not raw:
         return []
 
-    like_prefix = f"{q}%"
-    like_any = f"%{q}%"
+    # ✅ Soporta: "PN1, PN2", "PN1; PN2", pegar lista con saltos de línea, tabs
+    terms = [t.strip() for t in re.split(r"[,\n;\t]+", raw) if t.strip()]
+
+    # ✅ Límite de términos para evitar queries gigantes
+    terms = terms[:30]
+
+    # ✅ Para cada término armamos un grupo OR; luego combinamos todos con OR
+    groups = []
+    for t in terms:
+        like_prefix = f"{t}%"
+        like_any = f"%{t}%"
+
+        groups.append(
+            or_(
+                # códigos principales
+                models.Part.part_number_full.ilike(like_prefix),
+                models.Part.part_number_root.ilike(like_prefix),
+                # descripción
+                models.Part.description.ilike(like_any),
+                # atributos (equivalencias, end unit, etc.)
+                models.PartAttribute.attr_value.ilike(like_any),
+            )
+        )
+
+    combined_filter = or_(*groups)
 
     # JOIN con Supplier y OUTER JOIN con PartAttribute
     rows = (
@@ -1403,19 +1429,9 @@ def search_parts(
             models.PartAttribute,
             models.PartAttribute.part_id == models.Part.id,
         )
-        .filter(
-            or_(
-                # códigos principales
-                models.Part.part_number_full.ilike(like_prefix),
-                models.Part.part_number_root.ilike(like_prefix),
-                # descripción
-                models.Part.description.ilike(like_any),
-                # 🔹 ahora también busca en TODOS los atributos
-                models.PartAttribute.attr_value.ilike(like_any),
-            )
-        )
+        .filter(combined_filter)
         .order_by(models.Part.part_number_full)
-        .limit(50)
+        .limit(200)
         .all()
     )
 
@@ -1460,6 +1476,7 @@ def search_parts(
         results.append(item)
 
     return results
+
 
 @app.get("/catalogs", response_model=List[schemas.CatalogListOut])
 def list_catalogs(db: Session = Depends(get_db)):
