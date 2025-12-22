@@ -1488,3 +1488,31 @@ def list_catalogs(db: Session = Depends(get_db)):
     
     return results
 
+from fastapi import HTTPException
+from sqlalchemy.orm import Session
+from sqlalchemy import func
+
+@app.delete("/catalogs/{catalog_id}")
+def delete_catalog(catalog_id: int, db: Session = Depends(get_db)):
+    # 1) Verificar que exista
+    catalog = db.query(models.Catalog).filter(models.Catalog.id == catalog_id).first()
+    if not catalog:
+        raise HTTPException(status_code=404, detail="Catálogo no encontrado")
+
+    # 2) Buscar parts del catálogo
+    parts = db.query(models.Part).filter(models.Part.catalog_id == catalog_id).all()
+    part_ids = [p.id for p in parts]
+
+    # 3) Borrar dependencias (si NO tienes cascade configurado)
+    if part_ids:
+        db.query(models.PriceTier).filter(models.PriceTier.part_id.in_(part_ids)).delete(synchronize_session=False)
+        db.query(models.PartAttribute).filter(models.PartAttribute.part_id.in_(part_ids)).delete(synchronize_session=False)
+        db.query(models.Part).filter(models.Part.id.in_(part_ids)).delete(synchronize_session=False)
+
+    # 4) Borrar el catálogo
+    db.delete(catalog)
+    db.commit()
+
+    return {"message": "Catálogo eliminado", "catalog_id": catalog_id, "deleted_parts": len(part_ids)}
+
+
