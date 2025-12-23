@@ -31,6 +31,7 @@ import os
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
+from sqlalchemy import func, and_, or_
 
 
 # ============================================================
@@ -108,6 +109,26 @@ def get_or_create_supplier(db: Session, name: str) -> models.Supplier:
     db.refresh(supplier)
     return supplier
 
+def sql_normalize(col, db: Session):
+    """
+    Normaliza en SQL quitando separadores.
+    - Postgres: regexp_replace
+    - SQLite: replace encadenado (sin regex)
+    """
+    dialect = db.bind.dialect.name
+    base = func.upper(func.coalesce(col, ""))
+
+    if dialect == "postgresql":
+        return func.regexp_replace(base, r"[^A-Z0-9]", "", "g")
+
+    if dialect == "sqlite":
+        x = base
+        for ch in ["-", " ", ".", "/", "_", "(", ")", "[", "]"]:
+            x = func.replace(x, ch, "")
+        return x
+
+    return base
+
 
 def create_catalog(db: Session, supplier: models.Supplier, year: int, filename: str) -> models.Catalog:
     """Crea una nueva entrada de catálogo."""
@@ -130,6 +151,37 @@ def normalize_part_number(code: str) -> Tuple[str, str]:
     root = code.split("-")[0]
     return code, root
 
+import re
+
+_norm_re = re.compile(r"[^A-Za-z0-9]+")
+
+def normalize_pn(s: str) -> str:
+    """Deja el código en MAYÚSCULAS y sin separadores (solo A-Z 0-9)."""
+    if not s:
+        return ""
+    return _norm_re.sub("", str(s).upper().strip())
+
+
+def wildcard_x_match(pattern: str, value: str) -> bool:
+    """
+    Igual que antes, pero comparando en formato normalizado:
+    - Elimina guiones/espacios/etc en ambos
+    - 'X' significa cualquier alfanumérico
+    """
+    p = normalize_pn(pattern)
+    v = normalize_pn(value)
+
+    if not p or not v or len(p) != len(v):
+        return False
+
+    for pc, vc in zip(p, v):
+        if pc == "X":
+            if not vc.isalnum():
+                return False
+            continue
+        if pc != vc:
+            return False
+    return True
 
 # ============================================================
 #  Helpers de Lectura de Archivos
@@ -375,6 +427,16 @@ def detect_header_and_qty_ranges(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[s
         df.columns = col_names
 
     return df, qty_ranges_by_col_lower
+
+def smart_prefix(term: str, min_len: int = 6) -> str:
+    """
+    Devuelve un prefijo corto para reducir candidatos SQL.
+    Ej: '890107XXX' -> '890107'
+    """
+    if not term:
+        return ""
+    t = term.strip()
+    return t if len(t) <= min_len else t[:min_len]
 
 # ============================================================
 #  Helpers específicos HOLMCO
@@ -1377,15 +1439,17 @@ def get_stats(db: Session = Depends(get_db)):
     }
 # ============================================================
 #  Endpoint: búsqueda de piezas (incluye nombre del proveedor)
+#  - Soporta búsqueda sin guiones/espacios (normalización)
+#  - Soporta comodín X / XX / XXX (match flexible)
 # ============================================================
 import re
-from sqlalchemy import or_
+from sqlalchemy import or_, and_, func
 
 @app.get("/parts/search")
 def search_parts(
     query: str = Query(
         ...,
-        alias="q",  # ?q= en la URL
+        alias="q",
         min_length=1,
         description="Código o parte de la descripción (puede ser múltiple separado por coma o líneas)",
     ),
@@ -1395,40 +1459,48 @@ def search_parts(
     if not raw:
         return []
 
-    # ✅ Soporta: "PN1, PN2", "PN1; PN2", pegar lista con saltos de línea, tabs
+    # términos separados por coma / salto de línea / ; / tab
     terms = [t.strip() for t in re.split(r"[,\n;\t]+", raw) if t.strip()]
-
-    # ✅ Límite de términos para evitar queries gigantes
     terms = terms[:30]
 
-    # ✅ Para cada término armamos un grupo OR; luego combinamos todos con OR
     groups = []
     for t in terms:
+        t_norm = normalize_pn(t)  # <-- quita guiones/espacios/etc y uppercase
+
         like_prefix = f"{t}%"
         like_any = f"%{t}%"
 
+        # versión normalizada para búsquedas sin guiones (89-01-07XXX == 890107XXX)
+        like_prefix_norm = f"{t_norm}%"
+        like_any_norm = f"%{t_norm}%"
+
         groups.append(
             or_(
-                # códigos principales
+                # ----------------------------
+                # búsquedas "normales"
+                # ----------------------------
                 models.Part.part_number_full.ilike(like_prefix),
                 models.Part.part_number_root.ilike(like_prefix),
-                # descripción
                 models.Part.description.ilike(like_any),
-                # atributos (equivalencias, end unit, etc.)
                 models.PartAttribute.attr_value.ilike(like_any),
+                models.PartAlias.code.ilike(like_any),
+
+                # ----------------------------
+                # búsquedas "normalizadas" (sin guiones)
+                # ----------------------------
+                sql_normalize(models.Part.part_number_full, db).ilike(like_prefix_norm),
+                sql_normalize(models.Part.part_number_root, db).ilike(like_prefix_norm),
+                sql_normalize(models.PartAlias.code, db).ilike(like_any_norm),
             )
         )
 
     combined_filter = or_(*groups)
 
-    # JOIN con Supplier y OUTER JOIN con PartAttribute
     rows = (
         db.query(models.Part, models.Supplier)
         .join(models.Supplier, models.Part.supplier_id == models.Supplier.id)
-        .outerjoin(
-            models.PartAttribute,
-            models.PartAttribute.part_id == models.Part.id,
-        )
+        .outerjoin(models.PartAttribute, models.PartAttribute.part_id == models.Part.id)
+        .outerjoin(models.PartAlias, models.PartAlias.part_id == models.Part.id)
         .filter(combined_filter)
         .order_by(models.Part.part_number_full)
         .limit(200)
@@ -1436,11 +1508,11 @@ def search_parts(
     )
 
     results = []
-    seen_parts = set()  # para evitar duplicados por el JOIN con atributos
+    seen_parts = set()
 
-    for part, supplier in rows:
+    def push_part(part, supplier):
         if part.id in seen_parts:
-            continue
+            return
         seen_parts.add(part.id)
 
         item = {
@@ -1474,6 +1546,85 @@ def search_parts(
             ],
         }
         results.append(item)
+
+    for part, supplier in rows:
+        push_part(part, supplier)
+
+    # =========================================================
+    # ✅ SEGUNDA PASADA: Match contra patrones con 'X' (comodín)
+    #   - Comparación usando normalize_pn() dentro de wildcard_x_match()
+    #   - Considera también aliases con X
+    # =========================================================
+    if len(results) < 200:
+        for t in terms:
+            t_clean = (t or "").strip()
+            if not t_clean:
+                continue
+
+            t_norm = normalize_pn(t_clean)
+
+            # Prefijo corto para traer pocos candidatos
+            pref = smart_prefix(t_norm, min_len=6)
+            if not pref:
+                continue
+
+            wildcard_candidates = (
+                db.query(models.Part, models.Supplier)
+                .join(models.Supplier, models.Part.supplier_id == models.Supplier.id)
+                .outerjoin(models.PartAlias, models.PartAlias.part_id == models.Part.id)
+                .filter(
+                    or_(
+                        # Candidatos por part_number_full que tengan X (normalizado)
+                        and_(
+                            sql_normalize(models.Part.part_number_full, db).ilike(f"{pref}%"),
+                            sql_normalize(models.Part.part_number_full, db).ilike("%X%"),
+                        ),
+                        # Candidatos por alias que tengan X (normalizado)
+                        and_(
+                            sql_normalize(models.PartAlias.code, db).ilike(f"{pref}%"),
+                            sql_normalize(models.PartAlias.code, db).ilike("%X%"),
+                        ),
+                    )
+                )
+                .limit(800)
+                .all()
+            )
+
+            for part, supplier in wildcard_candidates:
+                if part.id in seen_parts:
+                    continue
+
+                # Match por PN principal (wildcard_x_match ya normaliza por dentro)
+                ok = wildcard_x_match(part.part_number_full, t_clean)
+
+                # Match por alias
+                if not ok:
+                    aliases = getattr(part, "aliases", None)
+                    if aliases is not None:
+                        ok = any(
+                            wildcard_x_match(a.code, t_clean)
+                            for a in aliases
+                            if a and a.code
+                        )
+                    else:
+                        alias_rows = (
+                            db.query(models.PartAlias.code)
+                            .filter(models.PartAlias.part_id == part.id)
+                            .all()
+                        )
+                        ok = any(
+                            wildcard_x_match(code, t_clean)
+                            for (code,) in alias_rows
+                            if code
+                        )
+
+                if ok:
+                    push_part(part, supplier)
+                    if len(results) >= 200:
+                        break
+
+            if len(results) >= 200:
+                break
 
     return results
 
