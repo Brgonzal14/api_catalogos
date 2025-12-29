@@ -295,6 +295,13 @@
               <button class="btn btn-primary w-100" type="submit">
                 Buscar
               </button>
+              <button
+              class="btn btn-outline-primary w-100"
+              type="button"
+              id="btnExportExcel"
+              title="Exportar resultados a Excel"
+            >
+              Exportar
             </div>
           </form>
           <div id="searchStatus" class="mt-2 small text-secondary"></div>
@@ -785,148 +792,172 @@
       }
     });
 
-    // ----- Subir catálogo -----
-    const uploadForm = document.getElementById("uploadForm");
-    const uploadStatus = document.getElementById("uploadStatus");
+// ----- Subir catálogo -----
+const uploadForm = document.getElementById("uploadForm");
+const uploadStatus = document.getElementById("uploadStatus");
 
-    uploadForm.addEventListener("submit", async (e) => {
-      e.preventDefault();
-      const fileInput = document.getElementById("catalogFile");
-      const vendorInput = document.getElementById("catalogVendor");
-      const currencyInput = document.getElementById("catalogCurrency");
+uploadForm.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const fileInput = document.getElementById("catalogFile");
+  const vendorInput = document.getElementById("catalogVendor");
+  const currencyInput = document.getElementById("catalogCurrency");
 
-      const file = fileInput.files[0];
-      if (!file) return;
+  const file = fileInput.files[0];
+  if (!file) return;
 
-      const formData = new FormData();
-      formData.append("file", file);
-      formData.append("supplier_name", vendorInput.value);
-      formData.append("year", new Date().getFullYear());
+  const formData = new FormData();
+  formData.append("file", file);
+  formData.append("supplier_name", vendorInput.value);
+  formData.append("year", new Date().getFullYear());
 
-      uploadStatus.textContent = "Subiendo catálogo...";
-      uploadStatus.className = "mt-3 small text-secondary";
+  uploadStatus.textContent = "Subiendo catálogo...";
+  uploadStatus.className = "mt-3 small text-secondary";
 
-      try {
-        const resp = await fetch(`${API_BASE}/catalogs/upload`, {
-          method: "POST",
-          body: formData,
-        });
-
-        if (!resp.ok) {
-          const errorText = await resp.text();
-          throw new Error(errorText || "Error al subir catálogo");
-        }
-
-        await resp.json().catch(() => ({}));
-
-        uploadStatus.textContent =
-          "Catálogo subido y procesado correctamente.";
-        uploadStatus.className = "mt-3 small text-success";
-
-        uploadForm.reset();
-        
-        // Refrescamos los stats y si estamos en la pestaña de catálogos, también la lista
-        loadStats();
-        loadCatalogs(); 
-      } catch (err) {
-        console.error(err);
-        uploadStatus.textContent =
-          "Error al subir catálogo. Revisa la consola o los logs del backend.";
-        uploadStatus.className = "mt-3 small text-danger";
-      }
+  try {
+    const resp = await fetch(`${API_BASE}/catalogs/upload`, {
+      method: "POST",
+      body: formData,
     });
 
-    // ----- Cargar lista de catálogos (NUEVA FUNCIÓN) -----
-    async function loadCatalogs() {
-      const tbody = document.getElementById("catalogsBody");
-      // Si no existe la tabla (por alguna razón), salimos
-      if (!tbody) return;
-
-      tbody.innerHTML = `
-        <tr><td colspan="5" class="text-center text-secondary">Cargando...</td></tr>
-      `;
-
-      try {
-        const resp = await fetch(`${API_BASE}/catalogs`);
-        if (!resp.ok) throw new Error("Error al obtener catálogos");
-        
-        const data = await resp.json();
-        
-        if (!Array.isArray(data) || data.length === 0) {
-          tbody.innerHTML = `
-            <tr><td colspan="5" class="text-center text-secondary">No hay catálogos subidos aún.</td></tr>
-          `;
-          return;
-        }
-
-        tbody.innerHTML = "";
-        data.forEach(cat => {
-          // Formatear fecha simple
-          let dateStr = "–";
-          if (cat.created_at) {
-            const dateObj = new Date(cat.created_at);
-            dateStr = dateObj.toLocaleString("es-CL");
-          }
-
-          const tr = document.createElement("tr");
-          tr.innerHTML = `
-            <td>${cat.id}</td>
-            <td class="fw-bold text-primary">${cat.supplier_name || '–'}</td>
-            <td>${cat.year}</td>
-            <td><code>${cat.original_filename}</code></td>
-            <td class="small">${dateStr}</td>
-          `;
-          tbody.appendChild(tr);
-        });
-        
-      } catch (err) {
-        console.error(err);
-        tbody.innerHTML = `
-          <tr><td colspan="5" class="text-center text-danger">Error al cargar la lista.</td></tr>
-        `;
-      }
+    if (!resp.ok) {
+      const errorText = await resp.text();
+      throw new Error(errorText || "Error al subir catálogo");
     }
 
-    // Listener para el botón de la pestaña
-    const btnCatalogs = document.getElementById("btn-tab-catalogs");
-    if (btnCatalogs) {
-      btnCatalogs.addEventListener("click", () => {
-        loadCatalogs();
-      });
-    }
+    await resp.json().catch(() => ({}));
 
-    // ----- Stats reales desde el backend (/stats) -----
-    async function loadStats() {
-      const elCatalogs = document.getElementById("statCatalogs");
-      const elParts = document.getElementById("statParts");
-      const elUpdated = document.getElementById("statUpdated");
+    uploadStatus.textContent = "Catálogo subido y procesado correctamente.";
+    uploadStatus.className = "mt-3 small text-success";
 
-      try {
-        const resp = await fetch(`${API_BASE}/stats`);
-        if (!resp.ok) throw new Error("Error al obtener /stats");
+    uploadForm.reset();
 
-        const data = await resp.json();
-
-        const catalogs = data.catalogs ?? 0;
-        const parts = data.parts ?? 0;
-
-        // Formateo lindo con separador de miles
-        elCatalogs.textContent = catalogs.toLocaleString("es-CL");
-        elParts.textContent = parts.toLocaleString("es-CL");
-
-        const ts = data.generated_at ? new Date(data.generated_at) : new Date();
-        elUpdated.textContent = ts.toLocaleString();
-      } catch (err) {
-        console.error("Error cargando /stats:", err);
-        // Fallback: mostramos guiones pero dejamos una fecha
-        elCatalogs.textContent = "–";
-        elParts.textContent = "–";
-        elUpdated.textContent = new Date().toLocaleString();
-      }
-    }
-
-    // Carga inicial
+    // Refrescamos los stats y si estamos en la pestaña de catálogos, también la lista
     loadStats();
+    loadCatalogs();
+  } catch (err) {
+    console.error(err);
+    uploadStatus.textContent =
+      "Error al subir catálogo. Revisa la consola o los logs del backend.";
+    uploadStatus.className = "mt-3 small text-danger";
+  }
+});
+
+// ----- Cargar lista de catálogos (NUEVA FUNCIÓN) -----
+async function loadCatalogs() {
+  const tbody = document.getElementById("catalogsBody");
+  // Si no existe la tabla (por alguna razón), salimos
+  if (!tbody) return;
+
+  tbody.innerHTML = `
+    <tr><td colspan="5" class="text-center text-secondary">Cargando...</td></tr>
+  `;
+
+  try {
+    const resp = await fetch(`${API_BASE}/catalogs`);
+    if (!resp.ok) throw new Error("Error al obtener catálogos");
+
+    const data = await resp.json();
+
+    if (!Array.isArray(data) || data.length === 0) {
+      tbody.innerHTML = `
+        <tr><td colspan="5" class="text-center text-secondary">No hay catálogos subidos aún.</td></tr>
+      `;
+      return;
+    }
+
+    tbody.innerHTML = "";
+    data.forEach((cat) => {
+      // Formatear fecha simple
+      let dateStr = "–";
+      if (cat.created_at) {
+        const dateObj = new Date(cat.created_at);
+        dateStr = dateObj.toLocaleString("es-CL");
+      }
+
+      const tr = document.createElement("tr");
+      tr.innerHTML = `
+        <td>${cat.id}</td>
+        <td class="fw-bold text-primary">${cat.supplier_name || "–"}</td>
+        <td>${cat.year}</td>
+        <td><code>${cat.original_filename}</code></td>
+        <td class="small">${dateStr}</td>
+      `;
+      tbody.appendChild(tr);
+    });
+  } catch (err) {
+    console.error(err);
+    tbody.innerHTML = `
+      <tr><td colspan="5" class="text-center text-danger">Error al cargar la lista.</td></tr>
+    `;
+  }
+}
+
+// Listener para el botón de la pestaña
+const btnCatalogs = document.getElementById("btn-tab-catalogs");
+if (btnCatalogs) {
+  btnCatalogs.addEventListener("click", () => {
+    loadCatalogs();
+  });
+}
+
+// ✅ NUEVO: Exportar búsqueda a Excel
+// Requiere que exista el botón con id="btnExportExcel" en el HTML
+const btnExportExcel = document.getElementById("btnExportExcel");
+if (btnExportExcel) {
+  btnExportExcel.addEventListener("click", () => {
+    const q = document.getElementById("searchQuery")?.value?.trim() || "";
+    const vendor = document.getElementById("searchVendor")?.value?.trim() || "";
+    const currency = document.getElementById("searchCurrency")?.value || "";
+
+    if (!q) {
+      alert("Primero ingresa un código o descripción para buscar.");
+      return;
+    }
+
+    const params = new URLSearchParams();
+    params.append("q", q);
+
+    // opcionales (los toma del formulario)
+    if (vendor) params.append("supplier", vendor);
+    if (currency) params.append("currency", currency);
+
+    window.open(`${API_BASE}/parts/search/export?${params.toString()}`, "_blank");
+  });
+}
+
+// ----- Stats reales desde el backend (/stats) -----
+async function loadStats() {
+  const elCatalogs = document.getElementById("statCatalogs");
+  const elParts = document.getElementById("statParts");
+  const elUpdated = document.getElementById("statUpdated");
+
+  try {
+    const resp = await fetch(`${API_BASE}/stats`);
+    if (!resp.ok) throw new Error("Error al obtener /stats");
+
+    const data = await resp.json();
+
+    const catalogs = data.catalogs ?? 0;
+    const parts = data.parts ?? 0;
+
+    // Formateo lindo con separador de miles
+    elCatalogs.textContent = catalogs.toLocaleString("es-CL");
+    elParts.textContent = parts.toLocaleString("es-CL");
+
+    const ts = data.generated_at ? new Date(data.generated_at) : new Date();
+    elUpdated.textContent = ts.toLocaleString();
+  } catch (err) {
+    console.error("Error cargando /stats:", err);
+    // Fallback: mostramos guiones pero dejamos una fecha
+    elCatalogs.textContent = "–";
+    elParts.textContent = "–";
+    elUpdated.textContent = new Date().toLocaleString();
+  }
+}
+
+// Carga inicial
+loadStats();
+
 
   </script>
 </body>

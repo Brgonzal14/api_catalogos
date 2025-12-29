@@ -24,7 +24,7 @@ import re
 import asyncio
 from datetime import datetime
 import pandas as pd
-
+from fastapi.responses import StreamingResponse
 from .db import Base, engine, get_db
 from . import models, schemas
 
@@ -107,6 +107,38 @@ def normalize_part_number(code: str) -> Tuple[str, str]:
     code = code.strip()
     root = code.split("-")[0]
     return code, root
+
+
+def format_prices_for_export(part) -> str:
+    """
+    Devuelve un string con todos los precios:
+    - Si hay price_tiers: los lista ordenados (min-max o >=min)
+    - Si no hay tiers pero hay base_price: usa min_qty_default
+    """
+    tiers = list(getattr(part, "price_tiers", []) or [])
+
+    # Si hay tiers, formateamos todos
+    if tiers:
+        # ordenar por min_qty (None al final)
+        tiers.sort(key=lambda x: (x.min_qty is None, x.min_qty or 0))
+        chunks = []
+        for t in tiers:
+            cur = t.currency or part.currency or ""
+            if t.max_qty is not None:
+                label = f"{t.min_qty}-{t.max_qty}"
+            else:
+                label = f">={t.min_qty}"
+            chunks.append(f"{label}: {t.unit_price} {cur}".strip())
+        return " | ".join(chunks)
+
+    # Si no hay tiers, usar base_price
+    if part.base_price is not None:
+        cur = part.currency or ""
+        minq = part.min_qty_default or 1
+        return f">={minq}: {part.base_price} {cur}".strip()
+
+    return ""
+
 
 
 # ============================================================
@@ -1492,3 +1524,101 @@ def list_catalogs(db: Session = Depends(get_db)):
         })
     
     return results
+
+# ============================================================
+#  Endpoint: Exportacion
+# ============================================================
+@app.get("/parts/search/export")
+def export_search_to_excel(
+    query: str = Query(..., alias="q", min_length=1),
+    supplier: str = Query(None, description="Nombre proveedor opcional (ej: STUKERJURGEN)"),
+    currency: str = Query(None, description="Moneda opcional (ej: USD / EUR)"),
+    db: Session = Depends(get_db),
+):
+    raw = (query or "").strip()
+    if not raw:
+        raise HTTPException(status_code=400, detail="q vacío")
+
+    terms = [t.strip() for t in re.split(r"[,\n;\t]+", raw) if t.strip()]
+    terms = terms[:30]
+
+    groups = []
+    for t in terms:
+        t_norm = normalize_pn(t)
+
+        like_prefix = f"{t}%"
+        like_any = f"%{t}%"
+        like_prefix_norm = f"{t_norm}%"
+        like_any_norm = f"%{t_norm}%"
+
+        groups.append(
+            or_(
+                models.Part.part_number_full.ilike(like_prefix),
+                models.Part.part_number_root.ilike(like_prefix),
+                models.Part.description.ilike(like_any),
+                models.PartAttribute.attr_value.ilike(like_any),
+                models.PartAlias.code.ilike(like_any),
+
+                # normalizado (sin guiones)
+                sql_normalize(models.Part.part_number_full, db).ilike(like_prefix_norm),
+                sql_normalize(models.Part.part_number_root, db).ilike(like_prefix_norm),
+                sql_normalize(models.PartAlias.code, db).ilike(like_any_norm),
+            )
+        )
+
+    combined_filter = or_(*groups)
+
+    q = (
+        db.query(models.Part)
+        .options(
+            joinedload(models.Part.price_tiers),
+            joinedload(models.Part.supplier),
+        )
+        .outerjoin(models.PartAttribute, models.PartAttribute.part_id == models.Part.id)
+        .outerjoin(models.PartAlias, models.PartAlias.part_id == models.Part.id)
+        .filter(combined_filter)
+    )
+
+    # filtros opcionales
+    if supplier:
+        q = q.join(models.Supplier).filter(models.Supplier.name.ilike(f"%{supplier}%"))
+
+    if currency:
+        q = q.filter(models.Part.currency == currency.upper())
+
+    parts = q.order_by(models.Part.part_number_full).limit(500).all()
+
+    # Si quieres, puedes aplicar también el wildcard X aquí (opcional).
+    # Para export rápido, normalmente con la primera pasada basta, pero si lo quieres lo sumamos.
+
+    rows = []
+    for p in parts:
+        rows.append(
+            {
+                "Part Number": p.part_number_full or "",
+                "Empresa": (p.supplier.name if getattr(p, "supplier", None) else ""),
+                "Precios": format_prices_for_export(p),
+            }
+        )
+
+    df = pd.DataFrame(rows, columns=["Part Number", "Empresa", "Precios"])
+
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="Resultados", index=False)
+
+        # Ajuste simple de ancho de columnas
+        ws = writer.sheets["Resultados"]
+        ws.column_dimensions["A"].width = 25
+        ws.column_dimensions["B"].width = 20
+        ws.column_dimensions["C"].width = 60
+
+    output.seek(0)
+
+    filename = f"busqueda_{normalize_pn(raw)[:20] or 'resultados'}.xlsx"
+
+    return StreamingResponse(
+        output,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
