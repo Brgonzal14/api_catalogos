@@ -175,24 +175,24 @@
     font-size: 0.85em;
   }
 </style>
-
 </head>
+
 <body>
   <nav class="navbar navbar-dark mb-4">
-  <div class="container d-flex justify-content-between align-items-center">
-    <a class="navbar-brand m-0" href="#">
-      <img
-        src="logo.svg"            
-        alt="Hansair"
-        style="height:32px; width:auto;"
-      />
-    </a>
+    <div class="container d-flex justify-content-between align-items-center">
+      <a class="navbar-brand m-0" href="#">
+        <img
+          src="/static/logo.svg"
+          alt="Hansair"
+          style="height:32px; width:auto;"
+        />
+      </a>
 
-    <span class="navbar-text small text-light">
-      FastAPI + Base de datos
-    </span>
-  </div>
-</nav>
+      <span class="navbar-text small text-light">
+        FastAPI + Base de datos
+      </span>
+    </div>
+  </nav>
 
   <div class="container mb-5">
     <div class="row g-3 mb-4">
@@ -207,6 +207,7 @@
               <li>Búsqueda unificada de repuestos por código o descripción.</li>
               <li>Visualización de información clave de cada pieza.</li>
               <li>Carga de nuevos catálogos en Excel/PDF hacia el backend.</li>
+            </ul>
           </div>
         </div>
       </div>
@@ -259,10 +260,12 @@
       </div>
     </div>
 
+    <!-- ===================== TAB SEARCH ===================== -->
     <div id="tab-search" class="tab-content-section">
       <div class="card mb-3">
         <div class="card-body">
           <h5 class="card-title mb-3">Buscar repuestos</h5>
+
           <form id="searchForm" class="row g-3">
             <div class="col-md-5">
               <label class="form-label small-label">Código o descripción</label>
@@ -274,6 +277,7 @@
                 required
               />
             </div>
+
             <div class="col-md-3">
               <label class="form-label small-label">Proveedor (opcional)</label>
               <input
@@ -283,6 +287,7 @@
                 placeholder="Ej: STUKERJURGEN"
               />
             </div>
+
             <div class="col-md-2">
               <label class="form-label small-label">Moneda (opcional)</label>
               <select class="form-select" id="searchCurrency">
@@ -291,19 +296,23 @@
                 <option value="EUR">EUR</option>
               </select>
             </div>
-            <div class="col-md-2 d-flex align-items-end">
+
+            <!-- ✅ Botones Buscar + Exportar -->
+            <div class="col-md-2 d-flex align-items-end gap-2">
               <button class="btn btn-primary w-100" type="submit">
                 Buscar
               </button>
               <button
-              class="btn btn-outline-primary w-100"
-              type="button"
-              id="btnExportExcel"
-              title="Exportar resultados a Excel"
-            >
-              Exportar
+                class="btn btn-outline-primary w-100"
+                type="button"
+                id="btnExportExcel"
+                title="Exportar resultados a Excel"
+              >
+                Exportar
+              </button>
             </div>
           </form>
+
           <div id="searchStatus" class="mt-2 small text-secondary"></div>
         </div>
       </div>
@@ -335,6 +344,7 @@
       </div>
     </div>
 
+    <!-- ===================== TAB CATALOGS ===================== -->
     <div id="tab-catalogs" class="tab-content-section" style="display: none;">
       <div class="card">
         <div class="card-body">
@@ -344,7 +354,7 @@
               🔄 Refrescar
             </button>
           </div>
-          
+
           <div class="table-responsive">
             <table class="table table-dark table-striped align-middle">
               <thead>
@@ -365,10 +375,12 @@
               </tbody>
             </table>
           </div>
+
         </div>
       </div>
     </div>
 
+    <!-- ===================== TAB UPLOAD ===================== -->
     <div id="tab-upload" class="tab-content-section" style="display: none;">
       <div class="card">
         <div class="card-body">
@@ -415,17 +427,13 @@
           </form>
 
           <div id="uploadStatus" class="mt-3 small"></div>
-
-          <hr class="border-secondary my-4" />
-
-          <div class="small text-secondary">
-            </em>
-          </div>
         </div>
       </div>
     </div>
+
   </div>
 
+  <!-- ===================== MODAL DETALLE ===================== -->
   <div class="modal fade" id="detailModal" tabindex="-1" aria-hidden="true">
     <div class="modal-dialog modal-lg modal-dialog-scrollable">
       <div class="modal-content" style="background:#020617;color:#e5e7eb;">
@@ -476,16 +484,11 @@
 
     // Helpers
     function formatLabel(key) {
-      return key
-        .replace(/_/g, " ")
-        .replace(/\b\w/g, (ch) => ch.toUpperCase());
+      return key.replace(/_/g, " ").replace(/\b\w/g, (ch) => ch.toUpperCase());
     }
 
     function escapeHtml(str) {
-      return String(str)
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;");
+      return String(str).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
     }
 
     // ----- Detalle amigable -----
@@ -500,13 +503,9 @@
       const contentEl = document.getElementById("detailContent");
       const rawPreEl = document.getElementById("detailJsonRaw");
 
-      if (code && desc) {
-        titleEl.textContent = `${code} – ${desc}`;
-      } else if (code) {
-        titleEl.textContent = `Detalle de ${code}`;
-      } else {
-        titleEl.textContent = "Detalle del repuesto";
-      }
+      if (code && desc) titleEl.textContent = `${code} – ${desc}`;
+      else if (code) titleEl.textContent = `Detalle de ${code}`;
+      else titleEl.textContent = "Detalle del repuesto";
 
       rawPreEl.textContent = JSON.stringify(item, null, 2);
 
@@ -515,7 +514,6 @@
       mainRows.push(["Código raíz", item.part_number_root || "–"]);
       mainRows.push(["Descripción", desc || "–"]);
 
-      // 👇 aquí preferimos supplier_name y dejamos los otros como fallback
       const proveedor =
         item.supplier_name ||
         (item.supplier && item.supplier.name) ||
@@ -528,9 +526,7 @@
 
       const moneda = item.currency || "–";
       const basePrice =
-        item.base_price !== undefined && item.base_price !== null
-          ? item.base_price.toFixed(2)
-          : "–";
+        item.base_price !== undefined && item.base_price !== null ? item.base_price.toFixed(2) : "–";
 
       mainRows.push(["Moneda base", moneda]);
       mainRows.push(["Precio base", basePrice]);
@@ -543,16 +539,12 @@
         <h6 class="mb-2">Información general</h6>
         <table class="table table-sm table-dark mb-3">
           <tbody>
-            ${mainRows
-              .map(
-                ([label, value]) => `
+            ${mainRows.map(([label, value]) => `
               <tr>
                 <th style="width:35%;">${escapeHtml(label)}</th>
                 <td>${escapeHtml(value)}</td>
               </tr>
-            `
-              )
-              .join("")}
+            `).join("")}
           </tbody>
         </table>
       `;
@@ -571,35 +563,26 @@
               </tr>
             </thead>
             <tbody>
-              ${tiers
-                .map((t) => {
-                  const minq = t.min_qty ?? "–";
-                  const maxq = t.max_qty ?? "–";
-                  const unitPrice =
-                    t.unit_price !== undefined && t.unit_price !== null
-                      ? t.unit_price.toFixed(2)
-                      : "–";
-                  const cur = t.currency || moneda || "–";
-                  return `
-                    <tr>
-                      <td>${escapeHtml(minq)}</td>
-                      <td>${escapeHtml(maxq)}</td>
-                      <td>${escapeHtml(unitPrice)}</td>
-                      <td>${escapeHtml(cur)}</td>
-                    </tr>
-                  `;
-                })
-                .join("")}
+              ${tiers.map((t) => {
+                const minq = t.min_qty ?? "–";
+                const maxq = t.max_qty ?? "–";
+                const unitPrice = (t.unit_price !== undefined && t.unit_price !== null) ? t.unit_price.toFixed(2) : "–";
+                const cur = t.currency || moneda || "–";
+                return `
+                  <tr>
+                    <td>${escapeHtml(minq)}</td>
+                    <td>${escapeHtml(maxq)}</td>
+                    <td>${escapeHtml(unitPrice)}</td>
+                    <td>${escapeHtml(cur)}</td>
+                  </tr>
+                `;
+              }).join("")}
             </tbody>
           </table>
         `;
       }
 
-      const attrs =
-        item.attributes ||
-        item.extra_attributes ||
-        [];
-
+      const attrs = item.attributes || item.extra_attributes || [];
       if (Array.isArray(attrs) && attrs.length) {
         html += `
           <h6 class="mb-2">Información específica del catálogo</h6>
@@ -611,74 +594,18 @@
               </tr>
             </thead>
             <tbody>
-              ${attrs
-                .map((a) => {
-                  const name = a.attr_name || a.name || "–";
-                  const value = a.attr_value || a.value || "–";
-                  return `
-                    <tr>
-                      <td>${escapeHtml(name)}</td>
-                      <td>${escapeHtml(value)}</td>
-                    </tr>
-                  `;
-                })
-                .join("")}
+              ${attrs.map((a) => {
+                const name = a.attr_name || a.name || "–";
+                const value = a.attr_value || a.value || "–";
+                return `
+                  <tr>
+                    <td>${escapeHtml(name)}</td>
+                    <td>${escapeHtml(value)}</td>
+                  </tr>
+                `;
+              }).join("")}
             </tbody>
           </table>
-        `;
-      }
-
-      const usedKeys = new Set([
-        "part_number_full",
-        "part_number_root",
-        "description",
-        "currency",
-        "base_price",
-        "min_qty_default",
-        "supplier",
-        "supplier_name",   // 👈 añadimos supplier_name para que no salga en “Otros”
-        "vendor_name",
-        "catalog",
-        "catalogs",
-        "catalog_source",
-        "price_tiers",
-        "attributes",
-        "extra_attributes",
-      ]);
-
-      const otherRows = [];
-      for (const [key, val] of Object.entries(item)) {
-        if (usedKeys.has(key)) continue;
-        if (val === null || val === undefined) continue;
-        let display;
-        if (Array.isArray(val) || typeof val === "object") {
-          display = "[ver en JSON completo]";
-        } else {
-          display = String(val);
-        }
-        otherRows.push([formatLabel(key), display]);
-      }
-
-      if (otherRows.length) {
-        html += `
-          <h6 class="mb-2">Otros campos</h6>
-          <table class="table table-sm table-dark mb-1">
-            <tbody>
-              ${otherRows
-                .map(
-                  ([label, value]) => `
-                <tr>
-                  <th style="width:35%;">${escapeHtml(label)}</th>
-                  <td>${escapeHtml(value)}</td>
-                </tr>
-              `
-                )
-                .join("")}
-            </tbody>
-          </table>
-          <p class="small text-secondary">
-            Para más detalle de estos campos, abre el JSON completo al final.
-          </p>
         `;
       }
 
@@ -706,9 +633,7 @@
       searchStatus.textContent = "Buscando repuestos...";
       resultsBody.innerHTML = `
         <tr>
-          <td colspan="4" class="text-center text-secondary">
-            Cargando resultados...
-          </td>
+          <td colspan="4" class="text-center text-secondary">Cargando resultados...</td>
         </tr>
       `;
       resultsCount.textContent = "";
@@ -719,9 +644,7 @@
         if (currency) params.append("currency", currency);
 
         const resp = await fetch(`${API_BASE}/parts/search?` + params.toString());
-        if (!resp.ok) {
-          throw new Error("Error al consultar la API");
-        }
+        if (!resp.ok) throw new Error("Error al consultar la API");
 
         const data = await resp.json();
         const results = Array.isArray(data) ? data : data.items || [];
@@ -745,7 +668,6 @@
           const codigo = item.part_number_full || item.part_number_root || "-";
           const desc = item.description || "-";
 
-          // 👇 preferimos supplier_name, si viene del backend nuevo
           const proveedor =
             item.supplier_name ||
             (item.supplier && item.supplier.name) ||
@@ -756,13 +678,11 @@
 
           const tr = document.createElement("tr");
           tr.innerHTML = `
-            <td><code>${codigo}</code></td>
-            <td>${desc}</td>
-            <td>${proveedor}</td>
+            <td><code>${escapeHtml(codigo)}</code></td>
+            <td>${escapeHtml(desc)}</td>
+            <td>${escapeHtml(proveedor)}</td>
             <td>
-              <button type="button"
-                      class="btn btn-sm btn-outline-light"
-                      data-detail-index="${idx}">
+              <button type="button" class="btn btn-sm btn-outline-light" data-detail-index="${idx}">
                 Ver
               </button>
             </td>
@@ -792,173 +712,163 @@
       }
     });
 
-// ----- Subir catálogo -----
-const uploadForm = document.getElementById("uploadForm");
-const uploadStatus = document.getElementById("uploadStatus");
+    // ✅ Exportar Excel
+    const btnExportExcel = document.getElementById("btnExportExcel");
+    if (btnExportExcel) {
+      btnExportExcel.addEventListener("click", () => {
+        const q = document.getElementById("searchQuery").value.trim();
+        const vendor = document.getElementById("searchVendor").value.trim();
+        const currency = document.getElementById("searchCurrency").value;
 
-uploadForm.addEventListener("submit", async (e) => {
-  e.preventDefault();
-  const fileInput = document.getElementById("catalogFile");
-  const vendorInput = document.getElementById("catalogVendor");
-  const currencyInput = document.getElementById("catalogCurrency");
+        if (!q) {
+          alert("Primero ingresa un código o descripción para buscar.");
+          return;
+        }
 
-  const file = fileInput.files[0];
-  if (!file) return;
+        const params = new URLSearchParams();
+        params.append("q", q);
 
-  const formData = new FormData();
-  formData.append("file", file);
-  formData.append("supplier_name", vendorInput.value);
-  formData.append("year", new Date().getFullYear());
+        // OJO: el export usa supplier (no vendor)
+        if (vendor) params.append("supplier", vendor);
+        if (currency) params.append("currency", currency);
 
-  uploadStatus.textContent = "Subiendo catálogo...";
-  uploadStatus.className = "mt-3 small text-secondary";
-
-  try {
-    const resp = await fetch(`${API_BASE}/catalogs/upload`, {
-      method: "POST",
-      body: formData,
-    });
-
-    if (!resp.ok) {
-      const errorText = await resp.text();
-      throw new Error(errorText || "Error al subir catálogo");
+        window.open(`${API_BASE}/parts/search/export?${params.toString()}`, "_blank");
+      });
     }
 
-    await resp.json().catch(() => ({}));
+    // ----- Subir catálogo -----
+    const uploadForm = document.getElementById("uploadForm");
+    const uploadStatus = document.getElementById("uploadStatus");
 
-    uploadStatus.textContent = "Catálogo subido y procesado correctamente.";
-    uploadStatus.className = "mt-3 small text-success";
+    uploadForm.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const fileInput = document.getElementById("catalogFile");
+      const vendorInput = document.getElementById("catalogVendor");
 
-    uploadForm.reset();
+      const file = fileInput.files[0];
+      if (!file) return;
 
-    // Refrescamos los stats y si estamos en la pestaña de catálogos, también la lista
-    loadStats();
-    loadCatalogs();
-  } catch (err) {
-    console.error(err);
-    uploadStatus.textContent =
-      "Error al subir catálogo. Revisa la consola o los logs del backend.";
-    uploadStatus.className = "mt-3 small text-danger";
-  }
-});
+      const formData = new FormData();
+      formData.append("file", file);
+      formData.append("supplier_name", vendorInput.value);
+      formData.append("year", new Date().getFullYear());
 
-// ----- Cargar lista de catálogos (NUEVA FUNCIÓN) -----
-async function loadCatalogs() {
-  const tbody = document.getElementById("catalogsBody");
-  // Si no existe la tabla (por alguna razón), salimos
-  if (!tbody) return;
+      uploadStatus.textContent = "Subiendo catálogo...";
+      uploadStatus.className = "mt-3 small text-secondary";
 
-  tbody.innerHTML = `
-    <tr><td colspan="5" class="text-center text-secondary">Cargando...</td></tr>
-  `;
+      try {
+        const resp = await fetch(`${API_BASE}/catalogs/upload`, {
+          method: "POST",
+          body: formData,
+        });
 
-  try {
-    const resp = await fetch(`${API_BASE}/catalogs`);
-    if (!resp.ok) throw new Error("Error al obtener catálogos");
+        if (!resp.ok) {
+          const errorText = await resp.text();
+          throw new Error(errorText || "Error al subir catálogo");
+        }
 
-    const data = await resp.json();
+        await resp.json().catch(() => ({}));
 
-    if (!Array.isArray(data) || data.length === 0) {
-      tbody.innerHTML = `
-        <tr><td colspan="5" class="text-center text-secondary">No hay catálogos subidos aún.</td></tr>
-      `;
-      return;
-    }
+        uploadStatus.textContent = "Catálogo subido y procesado correctamente.";
+        uploadStatus.className = "mt-3 small text-success";
 
-    tbody.innerHTML = "";
-    data.forEach((cat) => {
-      // Formatear fecha simple
-      let dateStr = "–";
-      if (cat.created_at) {
-        const dateObj = new Date(cat.created_at);
-        dateStr = dateObj.toLocaleString("es-CL");
+        uploadForm.reset();
+
+        loadStats();
+        loadCatalogs();
+      } catch (err) {
+        console.error(err);
+        uploadStatus.textContent =
+          "Error al subir catálogo. Revisa la consola o los logs del backend.";
+        uploadStatus.className = "mt-3 small text-danger";
       }
-
-      const tr = document.createElement("tr");
-      tr.innerHTML = `
-        <td>${cat.id}</td>
-        <td class="fw-bold text-primary">${cat.supplier_name || "–"}</td>
-        <td>${cat.year}</td>
-        <td><code>${cat.original_filename}</code></td>
-        <td class="small">${dateStr}</td>
-      `;
-      tbody.appendChild(tr);
     });
-  } catch (err) {
-    console.error(err);
-    tbody.innerHTML = `
-      <tr><td colspan="5" class="text-center text-danger">Error al cargar la lista.</td></tr>
-    `;
-  }
-}
 
-// Listener para el botón de la pestaña
-const btnCatalogs = document.getElementById("btn-tab-catalogs");
-if (btnCatalogs) {
-  btnCatalogs.addEventListener("click", () => {
-    loadCatalogs();
-  });
-}
+    // ----- Cargar lista de catálogos -----
+    async function loadCatalogs() {
+      const tbody = document.getElementById("catalogsBody");
+      if (!tbody) return;
 
-// ✅ NUEVO: Exportar búsqueda a Excel
-// Requiere que exista el botón con id="btnExportExcel" en el HTML
-const btnExportExcel = document.getElementById("btnExportExcel");
-if (btnExportExcel) {
-  btnExportExcel.addEventListener("click", () => {
-    const q = document.getElementById("searchQuery")?.value?.trim() || "";
-    const vendor = document.getElementById("searchVendor")?.value?.trim() || "";
-    const currency = document.getElementById("searchCurrency")?.value || "";
+      tbody.innerHTML = `
+        <tr><td colspan="5" class="text-center text-secondary">Cargando...</td></tr>
+      `;
 
-    if (!q) {
-      alert("Primero ingresa un código o descripción para buscar.");
-      return;
+      try {
+        const resp = await fetch(`${API_BASE}/catalogs`);
+        if (!resp.ok) throw new Error("Error al obtener catálogos");
+
+        const data = await resp.json();
+
+        if (!Array.isArray(data) || data.length === 0) {
+          tbody.innerHTML = `
+            <tr><td colspan="5" class="text-center text-secondary">No hay catálogos subidos aún.</td></tr>
+          `;
+          return;
+        }
+
+        tbody.innerHTML = "";
+        data.forEach((cat) => {
+          let dateStr = "–";
+          if (cat.created_at) {
+            const dateObj = new Date(cat.created_at);
+            dateStr = dateObj.toLocaleString("es-CL");
+          }
+
+          const tr = document.createElement("tr");
+          tr.innerHTML = `
+            <td>${escapeHtml(cat.id)}</td>
+            <td class="fw-bold text-primary">${escapeHtml(cat.supplier_name || "–")}</td>
+            <td>${escapeHtml(cat.year)}</td>
+            <td><code>${escapeHtml(cat.original_filename)}</code></td>
+            <td class="small">${escapeHtml(dateStr)}</td>
+          `;
+          tbody.appendChild(tr);
+        });
+      } catch (err) {
+        console.error(err);
+        tbody.innerHTML = `
+          <tr><td colspan="5" class="text-center text-danger">Error al cargar la lista.</td></tr>
+        `;
+      }
     }
 
-    const params = new URLSearchParams();
-    params.append("q", q);
+    const btnCatalogs = document.getElementById("btn-tab-catalogs");
+    if (btnCatalogs) {
+      btnCatalogs.addEventListener("click", () => {
+        loadCatalogs();
+      });
+    }
 
-    // opcionales (los toma del formulario)
-    if (vendor) params.append("supplier", vendor);
-    if (currency) params.append("currency", currency);
+    // ----- Stats reales desde el backend (/stats) -----
+    async function loadStats() {
+      const elCatalogs = document.getElementById("statCatalogs");
+      const elParts = document.getElementById("statParts");
+      const elUpdated = document.getElementById("statUpdated");
 
-    window.open(`${API_BASE}/parts/search/export?${params.toString()}`, "_blank");
-  });
-}
+      try {
+        const resp = await fetch(`${API_BASE}/stats`);
+        if (!resp.ok) throw new Error("Error al obtener /stats");
 
-// ----- Stats reales desde el backend (/stats) -----
-async function loadStats() {
-  const elCatalogs = document.getElementById("statCatalogs");
-  const elParts = document.getElementById("statParts");
-  const elUpdated = document.getElementById("statUpdated");
+        const data = await resp.json();
 
-  try {
-    const resp = await fetch(`${API_BASE}/stats`);
-    if (!resp.ok) throw new Error("Error al obtener /stats");
+        const catalogs = data.catalogs ?? 0;
+        const parts = data.parts ?? 0;
 
-    const data = await resp.json();
+        elCatalogs.textContent = catalogs.toLocaleString("es-CL");
+        elParts.textContent = parts.toLocaleString("es-CL");
 
-    const catalogs = data.catalogs ?? 0;
-    const parts = data.parts ?? 0;
+        const ts = data.generated_at ? new Date(data.generated_at) : new Date();
+        elUpdated.textContent = ts.toLocaleString();
+      } catch (err) {
+        console.error("Error cargando /stats:", err);
+        elCatalogs.textContent = "–";
+        elParts.textContent = "–";
+        elUpdated.textContent = new Date().toLocaleString();
+      }
+    }
 
-    // Formateo lindo con separador de miles
-    elCatalogs.textContent = catalogs.toLocaleString("es-CL");
-    elParts.textContent = parts.toLocaleString("es-CL");
-
-    const ts = data.generated_at ? new Date(data.generated_at) : new Date();
-    elUpdated.textContent = ts.toLocaleString();
-  } catch (err) {
-    console.error("Error cargando /stats:", err);
-    // Fallback: mostramos guiones pero dejamos una fecha
-    elCatalogs.textContent = "–";
-    elParts.textContent = "–";
-    elUpdated.textContent = new Date().toLocaleString();
-  }
-}
-
-// Carga inicial
-loadStats();
-
-
+    // Carga inicial
+    loadStats();
   </script>
 </body>
 </html>

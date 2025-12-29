@@ -8,7 +8,6 @@ from fastapi import (
     Query,
     HTTPException,
 )
-from sqlalchemy.orm import Session, joinedload
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import OperationalError
@@ -27,6 +26,14 @@ import pandas as pd
 from fastapi.responses import StreamingResponse
 from .db import Base, engine, get_db
 from . import models, schemas
+import os
+from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+from sqlalchemy import func, and_, or_
+from sqlalchemy.orm import joinedload
+import re
+from sqlalchemy import or_, and_, func
 
 # ============================================================
 #  Lifespan: crear tablas al iniciar la app (con reintentos)
@@ -63,14 +70,31 @@ async def lifespan(app: FastAPI):
 ## 🚀 Inicialización de la App
 app = FastAPI(title="API Catálogos Aeronáuticos", lifespan=lifespan)
 
-# --- CORS para permitir el front independiente ---
+# =========================
+# Frontend estático
+# =========================
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+
+# --- CORS para permitir el front independiente 
 app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],       # para demo lo dejamos abierto
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+     CORSMiddleware,
+     allow_origins=["*"],       # para demo lo dejamos abierto
+     allow_credentials=True,
+     allow_methods=["*"],
+     allow_headers=["*"],
+ ) 
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+FRONTEND_DIR = os.path.join(BASE_DIR, "frontend")
+
+app.mount("/static", StaticFiles(directory=FRONTEND_DIR), name="static")
+
+@app.get("/", include_in_schema=False)
+def read_frontend():
+    return FileResponse(os.path.join(FRONTEND_DIR, "index.html"))
+
+
 
 # ============================================================
 #  Helpers de BD
@@ -85,6 +109,26 @@ def get_or_create_supplier(db: Session, name: str) -> models.Supplier:
     db.commit()
     db.refresh(supplier)
     return supplier
+
+def sql_normalize(col, db: Session):
+    """
+    Normaliza en SQL quitando separadores.
+    - Postgres: regexp_replace
+    - SQLite: replace encadenado (sin regex)
+    """
+    dialect = db.bind.dialect.name
+    base = func.upper(func.coalesce(col, ""))
+
+    if dialect == "postgresql":
+        return func.regexp_replace(base, r"[^A-Z0-9]", "", "g")
+
+    if dialect == "sqlite":
+        x = base
+        for ch in ["-", " ", ".", "/", "_", "(", ")", "[", "]"]:
+            x = func.replace(x, ch, "")
+        return x
+
+    return base
 
 
 def create_catalog(db: Session, supplier: models.Supplier, year: int, filename: str) -> models.Catalog:
@@ -108,6 +152,37 @@ def normalize_part_number(code: str) -> Tuple[str, str]:
     root = code.split("-")[0]
     return code, root
 
+import re
+
+_norm_re = re.compile(r"[^A-Za-z0-9]+")
+
+def normalize_pn(s: str) -> str:
+    """Deja el código en MAYÚSCULAS y sin separadores (solo A-Z 0-9)."""
+    if not s:
+        return ""
+    return _norm_re.sub("", str(s).upper().strip())
+
+
+def wildcard_x_match(pattern: str, value: str) -> bool:
+    """
+    Igual que antes, pero comparando en formato normalizado:
+    - Elimina guiones/espacios/etc en ambos
+    - 'X' significa cualquier alfanumérico
+    """
+    p = normalize_pn(pattern)
+    v = normalize_pn(value)
+
+    if not p or not v or len(p) != len(v):
+        return False
+
+    for pc, vc in zip(p, v):
+        if pc == "X":
+            if not vc.isalnum():
+                return False
+            continue
+        if pc != vc:
+            return False
+    return True
 
 def format_prices_for_export(part) -> str:
     """
@@ -385,6 +460,16 @@ def detect_header_and_qty_ranges(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[s
         df.columns = col_names
 
     return df, qty_ranges_by_col_lower
+
+def smart_prefix(term: str, min_len: int = 6) -> str:
+    """
+    Devuelve un prefijo corto para reducir candidatos SQL.
+    Ej: '890107XXX' -> '890107'
+    """
+    if not term:
+        return ""
+    t = term.strip()
+    return t if len(t) <= min_len else t[:min_len]
 
 # ============================================================
 #  Helpers específicos HOLMCO
@@ -1387,54 +1472,79 @@ def get_stats(db: Session = Depends(get_db)):
     }
 # ============================================================
 #  Endpoint: búsqueda de piezas (incluye nombre del proveedor)
+#  - Soporta búsqueda sin guiones/espacios (normalización)
+#  - Soporta comodín X / XX / XXX (match flexible)
 # ============================================================
+
+
 @app.get("/parts/search")
 def search_parts(
     query: str = Query(
         ...,
-        alias="q",  # ?q= en la URL
+        alias="q",
         min_length=1,
-        description="Código o parte de la descripción",
+        description="Código o parte de la descripción (puede ser múltiple separado por coma o líneas)",
     ),
     db: Session = Depends(get_db),
 ):
-    q = query.strip()
-    if not q:
+    raw = (query or "").strip()
+    if not raw:
         return []
 
-    like_prefix = f"{q}%"
-    like_any = f"%{q}%"
+    # términos separados por coma / salto de línea / ; / tab
+    terms = [t.strip() for t in re.split(r"[,\n;\t]+", raw) if t.strip()]
+    terms = terms[:30]
 
-    # JOIN con Supplier y OUTER JOIN con PartAttribute
+    groups = []
+    for t in terms:
+        t_norm = normalize_pn(t)  # <-- quita guiones/espacios/etc y uppercase
+
+        like_prefix = f"{t}%"
+        like_any = f"%{t}%"
+
+        # versión normalizada para búsquedas sin guiones (89-01-07XXX == 890107XXX)
+        like_prefix_norm = f"{t_norm}%"
+        like_any_norm = f"%{t_norm}%"
+
+        groups.append(
+            or_(
+                # ----------------------------
+                # búsquedas "normales"
+                # ----------------------------
+                models.Part.part_number_full.ilike(like_prefix),
+                models.Part.part_number_root.ilike(like_prefix),
+                models.Part.description.ilike(like_any),
+                models.PartAttribute.attr_value.ilike(like_any),
+                models.PartAlias.code.ilike(like_any),
+
+                # ----------------------------
+                # búsquedas "normalizadas" (sin guiones)
+                # ----------------------------
+                sql_normalize(models.Part.part_number_full, db).ilike(like_prefix_norm),
+                sql_normalize(models.Part.part_number_root, db).ilike(like_prefix_norm),
+                sql_normalize(models.PartAlias.code, db).ilike(like_any_norm),
+            )
+        )
+
+    combined_filter = or_(*groups)
+
     rows = (
         db.query(models.Part, models.Supplier)
         .join(models.Supplier, models.Part.supplier_id == models.Supplier.id)
-        .outerjoin(
-            models.PartAttribute,
-            models.PartAttribute.part_id == models.Part.id,
-        )
-        .filter(
-            or_(
-                # códigos principales
-                models.Part.part_number_full.ilike(like_prefix),
-                models.Part.part_number_root.ilike(like_prefix),
-                # descripción
-                models.Part.description.ilike(like_any),
-                # 🔹 ahora también busca en TODOS los atributos
-                models.PartAttribute.attr_value.ilike(like_any),
-            )
-        )
+        .outerjoin(models.PartAttribute, models.PartAttribute.part_id == models.Part.id)
+        .outerjoin(models.PartAlias, models.PartAlias.part_id == models.Part.id)
+        .filter(combined_filter)
         .order_by(models.Part.part_number_full)
-        .limit(50)
+        .limit(200)
         .all()
     )
 
     results = []
-    seen_parts = set()  # para evitar duplicados por el JOIN con atributos
+    seen_parts = set()
 
-    for part, supplier in rows:
+    def push_part(part, supplier):
         if part.id in seen_parts:
-            continue
+            return
         seen_parts.add(part.id)
 
         item = {
@@ -1469,7 +1579,87 @@ def search_parts(
         }
         results.append(item)
 
+    for part, supplier in rows:
+        push_part(part, supplier)
+
+    # =========================================================
+    # ✅ SEGUNDA PASADA: Match contra patrones con 'X' (comodín)
+    #   - Comparación usando normalize_pn() dentro de wildcard_x_match()
+    #   - Considera también aliases con X
+    # =========================================================
+    if len(results) < 200:
+        for t in terms:
+            t_clean = (t or "").strip()
+            if not t_clean:
+                continue
+
+            t_norm = normalize_pn(t_clean)
+
+            # Prefijo corto para traer pocos candidatos
+            pref = smart_prefix(t_norm, min_len=6)
+            if not pref:
+                continue
+
+            wildcard_candidates = (
+                db.query(models.Part, models.Supplier)
+                .join(models.Supplier, models.Part.supplier_id == models.Supplier.id)
+                .outerjoin(models.PartAlias, models.PartAlias.part_id == models.Part.id)
+                .filter(
+                    or_(
+                        # Candidatos por part_number_full que tengan X (normalizado)
+                        and_(
+                            sql_normalize(models.Part.part_number_full, db).ilike(f"{pref}%"),
+                            sql_normalize(models.Part.part_number_full, db).ilike("%X%"),
+                        ),
+                        # Candidatos por alias que tengan X (normalizado)
+                        and_(
+                            sql_normalize(models.PartAlias.code, db).ilike(f"{pref}%"),
+                            sql_normalize(models.PartAlias.code, db).ilike("%X%"),
+                        ),
+                    )
+                )
+                .limit(800)
+                .all()
+            )
+
+            for part, supplier in wildcard_candidates:
+                if part.id in seen_parts:
+                    continue
+
+                # Match por PN principal (wildcard_x_match ya normaliza por dentro)
+                ok = wildcard_x_match(part.part_number_full, t_clean)
+
+                # Match por alias
+                if not ok:
+                    aliases = getattr(part, "aliases", None)
+                    if aliases is not None:
+                        ok = any(
+                            wildcard_x_match(a.code, t_clean)
+                            for a in aliases
+                            if a and a.code
+                        )
+                    else:
+                        alias_rows = (
+                            db.query(models.PartAlias.code)
+                            .filter(models.PartAlias.part_id == part.id)
+                            .all()
+                        )
+                        ok = any(
+                            wildcard_x_match(code, t_clean)
+                            for (code,) in alias_rows
+                            if code
+                        )
+
+                if ok:
+                    push_part(part, supplier)
+                    if len(results) >= 200:
+                        break
+
+            if len(results) >= 200:
+                break
+
     return results
+
 
 @app.get("/catalogs", response_model=List[schemas.CatalogListOut])
 def list_catalogs(db: Session = Depends(get_db)):
@@ -1498,7 +1688,33 @@ def list_catalogs(db: Session = Depends(get_db)):
     
     return results
 
-# ... imports existentes ...
+from fastapi import HTTPException
+from sqlalchemy.orm import Session
+from sqlalchemy import func
+
+@app.delete("/catalogs/{catalog_id}")
+def delete_catalog(catalog_id: int, db: Session = Depends(get_db)):
+    # 1) Verificar que exista
+    catalog = db.query(models.Catalog).filter(models.Catalog.id == catalog_id).first()
+    if not catalog:
+        raise HTTPException(status_code=404, detail="Catálogo no encontrado")
+
+    # 2) Buscar parts del catálogo
+    parts = db.query(models.Part).filter(models.Part.catalog_id == catalog_id).all()
+    part_ids = [p.id for p in parts]
+
+    # 3) Borrar dependencias (si NO tienes cascade configurado)
+    if part_ids:
+        db.query(models.PriceTier).filter(models.PriceTier.part_id.in_(part_ids)).delete(synchronize_session=False)
+        db.query(models.PartAttribute).filter(models.PartAttribute.part_id.in_(part_ids)).delete(synchronize_session=False)
+        db.query(models.Part).filter(models.Part.id.in_(part_ids)).delete(synchronize_session=False)
+
+    # 4) Borrar el catálogo
+    db.delete(catalog)
+    db.commit()
+
+    return {"message": "Catálogo eliminado", "catalog_id": catalog_id, "deleted_parts": len(part_ids)}
+
 
 @app.get("/catalogs", response_model=List[schemas.CatalogListOut])
 def list_catalogs(db: Session = Depends(get_db)):
@@ -1524,9 +1740,13 @@ def list_catalogs(db: Session = Depends(get_db)):
         })
     
     return results
+from fastapi.responses import StreamingResponse
+from collections import defaultdict
 
 # ============================================================
-#  Endpoint: Exportacion
+#  Endpoint: Exportación (Part Number | Empresa | Precios)
+#  - NO usa joinedload(models.Part.supplier) para evitar 500
+#  - Trae todos los tramos en una sola columna
 # ============================================================
 @app.get("/parts/search/export")
 def export_search_to_excel(
@@ -1553,13 +1773,14 @@ def export_search_to_excel(
 
         groups.append(
             or_(
+                # normal
                 models.Part.part_number_full.ilike(like_prefix),
                 models.Part.part_number_root.ilike(like_prefix),
                 models.Part.description.ilike(like_any),
                 models.PartAttribute.attr_value.ilike(like_any),
                 models.PartAlias.code.ilike(like_any),
 
-                # normalizado (sin guiones)
+                # normalizado (sin guiones/espacios)
                 sql_normalize(models.Part.part_number_full, db).ilike(like_prefix_norm),
                 sql_normalize(models.Part.part_number_root, db).ilike(like_prefix_norm),
                 sql_normalize(models.PartAlias.code, db).ilike(like_any_norm),
@@ -1569,11 +1790,8 @@ def export_search_to_excel(
     combined_filter = or_(*groups)
 
     q = (
-        db.query(models.Part)
-        .options(
-            joinedload(models.Part.price_tiers),
-            joinedload(models.Part.supplier),
-        )
+        db.query(models.Part, models.Supplier)
+        .join(models.Supplier, models.Part.supplier_id == models.Supplier.id)
         .outerjoin(models.PartAttribute, models.PartAttribute.part_id == models.Part.id)
         .outerjoin(models.PartAlias, models.PartAlias.part_id == models.Part.id)
         .filter(combined_filter)
@@ -1581,40 +1799,69 @@ def export_search_to_excel(
 
     # filtros opcionales
     if supplier:
-        q = q.join(models.Supplier).filter(models.Supplier.name.ilike(f"%{supplier}%"))
+        q = q.filter(models.Supplier.name.ilike(f"%{supplier}%"))
 
     if currency:
         q = q.filter(models.Part.currency == currency.upper())
 
-    parts = q.order_by(models.Part.part_number_full).limit(500).all()
+    rows = q.order_by(models.Part.part_number_full).limit(500).all()
 
-    # Si quieres, puedes aplicar también el wildcard X aquí (opcional).
-    # Para export rápido, normalmente con la primera pasada basta, pero si lo quieres lo sumamos.
+    # --- traer tiers en 1 query (sin depender de relación ORM) ---
+    part_ids = [p.id for (p, s) in rows]
+    tiers_by_part = defaultdict(list)
 
-    rows = []
-    for p in parts:
-        rows.append(
+    if part_ids:
+        tier_rows = (
+            db.query(models.PriceTier)
+            .filter(models.PriceTier.part_id.in_(part_ids))
+            .order_by(models.PriceTier.part_id, models.PriceTier.min_qty)
+            .all()
+        )
+        for tr in tier_rows:
+            tiers_by_part[tr.part_id].append(tr)
+
+    def format_prices(part) -> str:
+        tiers = tiers_by_part.get(part.id, []) or []
+
+        if tiers:
+            chunks = []
+            for t in tiers:
+                cur = t.currency or part.currency or ""
+                if t.max_qty is not None:
+                    label = f"{t.min_qty}-{t.max_qty}"
+                else:
+                    label = f">={t.min_qty}"
+                chunks.append(f"{label}: {t.unit_price} {cur}".strip())
+            return " | ".join(chunks)
+
+        if part.base_price is not None:
+            cur = part.currency or ""
+            minq = part.min_qty_default or 1
+            return f">={minq}: {part.base_price} {cur}".strip()
+
+        return ""
+
+    export_rows = []
+    for part, sup in rows:
+        export_rows.append(
             {
-                "Part Number": p.part_number_full or "",
-                "Empresa": (p.supplier.name if getattr(p, "supplier", None) else ""),
-                "Precios": format_prices_for_export(p),
+                "Part Number": part.part_number_full or part.part_number_root or "",
+                "Empresa": sup.name if sup else "",
+                "Precios": format_prices(part),
             }
         )
 
-    df = pd.DataFrame(rows, columns=["Part Number", "Empresa", "Precios"])
+    df = pd.DataFrame(export_rows, columns=["Part Number", "Empresa", "Precios"])
 
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         df.to_excel(writer, sheet_name="Resultados", index=False)
-
-        # Ajuste simple de ancho de columnas
         ws = writer.sheets["Resultados"]
-        ws.column_dimensions["A"].width = 25
-        ws.column_dimensions["B"].width = 20
-        ws.column_dimensions["C"].width = 60
+        ws.column_dimensions["A"].width = 28
+        ws.column_dimensions["B"].width = 22
+        ws.column_dimensions["C"].width = 70
 
     output.seek(0)
-
     filename = f"busqueda_{normalize_pn(raw)[:20] or 'resultados'}.xlsx"
 
     return StreamingResponse(
