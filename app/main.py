@@ -412,19 +412,44 @@ def detect_header_and_qty_ranges(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[s
     """
     Detecta la fila de encabezados y rangos de cantidad.
     Ajusta el DataFrame para que solo contenga datos y actualiza las columnas.
+
+    Mejora: evita falsos positivos (p.ej. filas tipo "Items on this list...")
+    exigiendo al menos 2 señales de cabecera (part/item number, description, price, currency).
     """
     header_row_idx = None
+
+    def _row_signals(lower_vals: List[str]) -> int:
+        has_part = any(("part" in v and "number" in v) for v in lower_vals)
+        has_itemnum = any(("item" in v and "number" in v) for v in lower_vals)
+        has_desc = any(("description" == v) or ("description" in v) for v in lower_vals)
+        has_price = any(("price" in v) for v in lower_vals)
+        has_curr = any(("currency" in v) or (v in ("usd", "eur", "euro")) for v in lower_vals)
+
+        score = 0
+        if has_part or has_itemnum:
+            score += 1
+        if has_desc:
+            score += 1
+        if has_price:
+            score += 1
+        if has_curr:
+            score += 1
+        return score
+
     for i, row in df.head(40).iterrows():
-        lower_vals = [str(v).strip().lower() for v in row.values if isinstance(v, str)]
-        has_part_header = any("part" in v and "number" in v for v in lower_vals)
-        has_description = "description" in lower_vals
-        has_item = any(v.startswith("item") for v in lower_vals)
-        if has_part_header or has_description or has_item:
+        lower_vals = []
+        for v in row.values:
+            if isinstance(v, str):
+                vv = re.sub(r"\s+", " ", v.replace("\u00a0", " ")).strip().lower()
+                if vv:
+                    lower_vals.append(vv)
+
+        # Cabecera si detectamos >= 2 señales
+        if _row_signals(lower_vals) >= 2:
             header_row_idx = i
             break
 
     qty_ranges_by_col_lower: Dict[str, str] = {}
-    start_data_idx = 0
     col_names: List[str] = []
 
     if header_row_idx is not None:
@@ -432,12 +457,17 @@ def detect_header_and_qty_ranges(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[s
         next_row = df.iloc[header_row_idx + 1] if header_row_idx + 1 < len(df) else None
 
         for idx, val in enumerate(header_row):
-            raw_name = str(val).strip() if val is not None else ""
+            # Evitar columnas "nan" cuando hay merges o celdas vacías
+            if val is None or (isinstance(val, float) and pd.isna(val)) or (isinstance(val, str) and val.strip().lower() == "nan"):
+                raw_name = ""
+            else:
+                raw_name = str(val).strip()
+
             if not raw_name:
                 raw_name = f"col_{idx}"
 
             col_name = raw_name
-            col_key_lower = raw_name.strip().lower()
+            col_key_lower = re.sub(r"\s+", " ", raw_name.replace("\u00a0", " ")).strip().lower()
 
             # Para columnas Qty/ea, añadimos el rango de la fila siguiente
             if next_row is not None and "qty/ea" in col_key_lower:
@@ -445,7 +475,7 @@ def detect_header_and_qty_ranges(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[s
                 if isinstance(vr, str) and vr.strip():
                     range_text = vr.strip()
                     col_name = f"{raw_name} {range_text}"  # p.ej. "Qty/ea 25-99"
-                    col_key_lower = col_name.strip().lower()
+                    col_key_lower = re.sub(r"\s+", " ", col_name.replace("\u00a0", " ")).strip().lower()
                     qty_ranges_by_col_lower[col_key_lower] = range_text
 
             col_names.append(col_name)
@@ -1115,8 +1145,17 @@ async def upload_catalog(
                     engine="openpyxl" if ext == ".xlsx" else None,
                 )
                 for sheet_name in excel_file.sheet_names:
+                    sn = str(sheet_name).strip().lower()
+                    # Evitar hojas de portada / administración / introducción, etc.
+                    if any(k in sn for k in ("readme", "read me", "header", "document", "administration", "introduction", "cover", "index", "contents")):
+                        continue
                     tmp_df = excel_file.parse(sheet_name)
                     if not tmp_df.empty:
+                        # Guardar nombre de hoja para trazabilidad
+                        try:
+                            tmp_df.attrs["sheet_name"] = sheet_name
+                        except Exception:
+                            pass
                         dfs.append(tmp_df)
             except Exception as e_openpyxl:
                 # Fallback solo para .xlsx (primera hoja)
@@ -1162,12 +1201,18 @@ async def upload_catalog(
     # cache para no crear varios Part con el mismo código
     # clave: (catalog_id, supplier_id, part_number_full)
     part_cache: Dict[Tuple[int, int, str], models.Part] = {}
+    alias_cache: set[Tuple[int, str]] = set()  # (part_id, alias_code)
     inserted = 0
 
     # ===============================
     # Procesar cada hoja / tabla
     # ===============================
     for original_df in dfs:
+        sheet_name = None
+        try:
+            sheet_name = original_df.attrs.get("sheet_name")
+        except Exception:
+            pass
         if original_df.empty:
             continue
 
@@ -1184,9 +1229,14 @@ async def upload_catalog(
             "part number": "part_number", "part_number": "part_number", "part numbep": "part_number",
             "pn": "part_number", "p/n": "part_number", "part-no.": "part_number",
             "part-no": "part_number", "part no.": "part_number",
+            "cml item number": "part_number",  # CML
+            "rf part number": "part_number",   # COLLINS (tras limpiar \n)
+
 
             # Article / ArticleNo
             "articleno.": "article_no", "article no.": "article_no", "article no": "article_no",
+            "standard part number": "alias_code",
+
 
             # columnas ITEM (AIRTEC-BRAIDS)
             "item (standard)": "part_number", "item (other)": "part_number", "item": "part_number",
@@ -1196,6 +1246,10 @@ async def upload_catalog(
 
             # precio
             "price": "price", "precio": "price", "master $": "price",
+            "price each": "price",
+            "unit price": "price",
+            "unit price 2026": "price",
+
 
             # moneda
             "currency": "currency", "moneda": "currency",
@@ -1211,19 +1265,45 @@ async def upload_catalog(
         }
 
         normalized_cols: Dict[str, str] = {}
+        seen_names: Dict[str, int] = {}
+
         for col in df.columns:
-            raw_name = str(col).strip()
-            col_key = raw_name.lower()
+            raw_name = str(col).strip() if col is not None else ""
+            raw_name = raw_name.replace("\u00a0", " ")
+            col_key = re.sub(r"\s+", " ", raw_name).strip().lower()
+
+            mapped: str
 
             # 1) Mapeo exacto
             if col_key in column_map:
                 mapped = column_map[col_key]
 
-            # 2) PANASONIC Master Price List: columnas tipo "Master S2 2023", etc.
+            # 2) Heurística: columnas que contienen 'part number' (COLLINS: 'RF\npart number', etc.)
+            elif "part number" in col_key:
+                if "standard" in col_key:
+                    mapped = "alias_code"
+                else:
+                    mapped = "part_number"
+
+            # 3) Heurística: 'item number' (CML: 'CML Item Number')
+            elif "item number" in col_key:
+                mapped = "part_number"
+
+            # 4) Heurística: precios (incluye símbolos € / $ o texto USD/EUR)
+            elif "unit price" in col_key or col_key.startswith("price"):
+                has_eur = ("€" in raw_name) or ("euro" in col_key) or (" eur" in col_key) or (" in €" in col_key)
+                has_usd = ("$" in raw_name) or ("usd" in col_key) or (" in $" in col_key)
+
+                if default_currency == "EUR":
+                    mapped = "price" if (has_eur or not has_usd) else "price_usd"
+                else:
+                    mapped = "price" if (has_usd or not has_eur) else "price_eur"
+
+            # 5) PANASONIC Master Price List: columnas tipo "Master S2 2023", etc.
             elif "master" in col_key and ("s2" in col_key or "$" in col_key):
                 mapped = "price"
 
-            # 3) Variaciones de acumulado / lifecycle
+            # 6) Variaciones de acumulado / lifecycle
             elif "cumulative" in col_key:
                 mapped = "cumulative"
             elif "lifecycle" in col_key:
@@ -1231,6 +1311,11 @@ async def upload_catalog(
 
             else:
                 mapped = col_key
+
+            # Evitar columnas duplicadas (COLLINS 098 trae 2x Currency, etc.)
+            seen_names[mapped] = seen_names.get(mapped, 0) + 1
+            if seen_names[mapped] > 1:
+                mapped = f"{mapped}_{seen_names[mapped]}"
 
             normalized_cols[col] = mapped
 
@@ -1310,6 +1395,13 @@ async def upload_catalog(
                 if currency_val is not None and str(currency_val) != "nan"
                 else None
             )
+            # Normalizar monedas (COLLINS usa 'EURO')
+            if currency:
+                if currency in ("EURO", "EUROS"):
+                    currency = "EUR"
+                elif currency in ("US$", "US DOLLAR", "USDOLLAR"):
+                    currency = "USD"
+
 
             # ---------- CANTIDAD MÍNIMA ----------
             min_qty = row.get("min_qty")
@@ -1379,6 +1471,30 @@ async def upload_catalog(
                 part_cache[cache_key] = part
                 inserted += 1
                 is_new_part = True
+                # --------- ALIASES (Standard part number, etc.) ---------
+                alias_val = row.get("alias_code")
+                if alias_val is not None and str(alias_val) != "nan" and str(alias_val).strip():
+                    for ac in re.split(r"[\n,;/]+", str(alias_val)):
+                        ac = ac.strip()
+                        if not ac:
+                            continue
+                        if ac == part.part_number_full:
+                            continue
+                        key = (part.id, ac)
+                        if key in alias_cache:
+                            continue
+                        alias_cache.add(key)
+                        try:
+                            db.add(models.PartAlias(part_id=part.id, code=ac, source="ALIAS"))
+                        except Exception:
+                            pass
+
+                # --------- TRAZABILIDAD: hoja original ---------
+                if sheet_name:
+                    try:
+                        db.add(models.PartAttribute(part_id=part.id, attr_name="Hoja Original", attr_value=str(sheet_name)))
+                    except Exception:
+                        pass
 
             # --------- PRICE TIERS (rangos / cantidades) ---------
             if tier_prices:
