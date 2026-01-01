@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import OperationalError
 from sqlalchemy import or_
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Any
 from contextlib import asynccontextmanager
 import os
 import io
@@ -162,6 +162,49 @@ def normalize_pn(s: str) -> str:
         return ""
     return _norm_re.sub("", str(s).upper().strip())
 
+
+
+def extract_alias_codes(raw: Optional[str]) -> List[str]:
+    """
+    Extrae códigos equivalentes desde una celda.
+    Soporta:
+      - separados por coma / ; / salto de línea
+      - paréntesis: "CODE1 (CODE2)" -> ["CODE1", "CODE2"]
+    """
+    if raw is None:
+        return []
+
+    s = str(raw).strip()
+    if not s or s.lower() == "nan":
+        return []
+
+    # separar por coma / ; / saltos
+    chunks = [c.strip() for c in re.split(r"[,\n;]+", s) if c and c.strip()]
+    out: List[str] = []
+
+    for c in chunks:
+        # CODE1 (CODE2)
+        m = re.match(r"^(.*?)\((.*?)\)$", c)
+        if m:
+            a = m.group(1).strip()
+            b = m.group(2).strip()
+            if a:
+                out.append(a)
+            if b:
+                out.append(b)
+        else:
+            out.append(c)
+
+    # dedupe preservando orden
+    seen = set()
+    deduped = []
+    for x in out:
+        if x in seen:
+            continue
+        seen.add(x)
+        deduped.append(x)
+
+    return deduped
 
 def wildcard_x_match(pattern: str, value: str) -> bool:
     """
@@ -318,6 +361,263 @@ def read_pdf_tables(pdf_bytes: bytes) -> pd.DataFrame:
 
     return pd.DataFrame(norm_rows)
 
+# ============================================================
+#  Helpers PDF (vendor-specific): IPECO / DIEHL
+#  - Algunos PDFs NO exponen tablas a pdfplumber, así que los
+#    parseamos desde texto usando pypdf.
+# ============================================================
+
+def _iter_text_pages_pypdf(pdf_bytes: bytes, max_pages: Optional[int] = None):
+    """
+    Itera el texto extraído por página.
+
+    Preferimos **PyPDF2** (está en tus requirements). Si no está disponible,
+    intentamos con **pypdf** como fallback.
+    """
+    PdfReader = None
+    err_1 = None
+    try:
+        from PyPDF2 import PdfReader as _PdfReader  # type: ignore
+        PdfReader = _PdfReader
+    except Exception as e1:
+        err_1 = e1
+        try:
+            from pypdf import PdfReader as _PdfReader  # type: ignore
+            PdfReader = _PdfReader
+        except Exception as e2:
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "El soporte PDF (texto) requiere 'PyPDF2' (recomendado) o 'pypdf'. "
+                    f"Detalle PyPDF2: {err_1} | Detalle pypdf: {e2}"
+                ),
+            )
+
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+
+    # algunos PDFs pueden venir cifrados
+    try:
+        if getattr(reader, "is_encrypted", False):
+            try:
+                reader.decrypt("")  # contraseña vacía
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    n = len(reader.pages)
+    if max_pages is not None:
+        n = min(n, max_pages)
+
+    for i in range(n):
+        yield (reader.pages[i].extract_text() or "")
+
+
+def _first_page_text_pypdf(pdf_bytes: bytes) -> str:
+    for t in _iter_text_pages_pypdf(pdf_bytes, max_pages=1):
+        return t or ""
+    return ""
+
+
+def _looks_like_ipeco(first_text: str) -> bool:
+    t = (first_text or "").lower()
+    # El PDF suele decir "IPECO ... Dollar Price List"
+    return ("ipeco" in t) or ("dollar price list" in t and "material" in t)
+
+
+def _looks_like_diehl(first_text: str) -> bool:
+    t = (first_text or "").lower()
+    # Suele decir "DIEHL Aviation Hamburg GmbH" / "Broker Net Price List"
+    return ("diehl" in t) or ("broker net price list" in t)
+
+
+def parse_pdf_ipeco(pdf_bytes: bytes) -> pd.DataFrame:
+    """
+    IPECO 2026 Dollar Price List (PDF):
+      Material | Description | Price (USD) | Per | UoM | Of | Lead Time (days) | Export Licence
+    Nota: se extrae desde texto (pypdf), no desde tablas.
+    """
+    rows: List[Dict[str, Any]] = []
+
+    for page_text in _iter_text_pages_pypdf(pdf_bytes):
+        if not page_text:
+            continue
+
+        for line in page_text.splitlines():
+            s = (line or "").strip()
+            if not s:
+                continue
+
+            low = s.lower()
+            # saltar cabeceras y títulos
+            if low.startswith("material") and ("price" in low or "uom" in low):
+                continue
+            if "ipeco" in low and "price list" in low:
+                continue
+
+            tokens = s.split()
+            if len(tokens) < 7:
+                continue
+
+            part_no = tokens[0]
+
+            # Encuentra los 2 últimos tokens NUMÉRICOS: Of y LeadTime
+            num_idxs = [i for i, tok in enumerate(tokens) if tok.isdigit()]
+            if len(num_idxs) < 2:
+                continue
+
+            lead_idx = num_idxs[-1]
+            of_idx = num_idxs[-2]
+
+            # Estructura esperada al final:
+            # ... <price> <per> <uom> <of> <lead> [export_licence...]
+            uom_idx = of_idx - 1
+            per_idx = uom_idx - 1
+            price_idx = per_idx - 1
+
+            if price_idx < 2 or lead_idx <= of_idx:
+                continue
+
+            price_raw = tokens[price_idx]
+            price_val = parse_price_value(price_raw)
+            if price_val is None:
+                continue
+
+            description = " ".join(tokens[1:price_idx]).strip()
+            per_qty = tokens[per_idx]
+            uom = tokens[uom_idx]
+            of_qty = tokens[of_idx]
+            lead_time = tokens[lead_idx]
+            export_lic = " ".join(tokens[lead_idx + 1:]).strip() or None
+
+            rows.append(
+                {
+                    "Material": part_no,
+                    "Description": description,
+                    "Price (USD)": price_raw,
+                    "Currency": "USD",
+                    "Per": per_qty,
+                    "UoM": uom,
+                    "Of": of_qty,
+                    "Lead Time (days)": lead_time,
+                    "Export Licence": export_lic,
+                }
+            )
+
+    return pd.DataFrame(rows)
+
+
+def parse_pdf_diehl(pdf_bytes: bytes) -> pd.DataFrame:
+    """
+    DIEHL Broker Price Catalogue (PDF):
+      PNR | Description | Effect Date (YYYYMMDD) | UNT | Price 2026 | CUR | MOQ | SPQ | LTM
+    Nota: el formato viene "en línea", por eso se extrae desde texto (pypdf).
+    """
+    rows: List[Dict[str, Any]] = []
+    date_re = re.compile(r"^\d{8}$")
+
+    for page_text in _iter_text_pages_pypdf(pdf_bytes):
+        if not page_text:
+            continue
+
+        for line in page_text.splitlines():
+            s = (line or "").strip()
+            if not s:
+                continue
+
+            low = s.lower()
+            # saltar cabeceras
+            if low.startswith("pnr ") or low.startswith("pnr\t"):
+                continue
+            if "broker net price list" in low or "diehl aviation" in low:
+                # puede ser cabecera de página
+                continue
+
+            tokens = s.split()
+            if len(tokens) < 6:
+                continue
+
+            pnr = tokens[0]
+
+            # encontrar índice de fecha efecto
+            date_idx = None
+            for i, tok in enumerate(tokens):
+                if date_re.match(tok):
+                    date_idx = i
+                    break
+            if date_idx is None or date_idx < 2:
+                continue
+            if date_idx + 3 >= len(tokens):
+                continue
+
+            desc = " ".join(tokens[1:date_idx]).strip()
+            eff_date = tokens[date_idx]
+            unt = tokens[date_idx + 1]
+            price_raw = tokens[date_idx + 2]
+            cur = tokens[date_idx + 3]
+
+            # resto: MOQ [SPQ LTM] o "on request"
+            rest = tokens[date_idx + 4:]
+            moq = rest[0] if len(rest) >= 1 else None
+            spq = None
+            ltm = None
+
+            if len(rest) >= 3 and rest[1].isdigit() and rest[2].isdigit():
+                spq = rest[1]
+                ltm = rest[2]
+            else:
+                # Ej: "1 on request"
+                tail = " ".join(rest[1:]).strip() if len(rest) > 1 else ""
+                if tail:
+                    ltm = tail
+
+            # validar precio
+            if parse_price_value(price_raw) is None:
+                continue
+
+            rows.append(
+                {
+                    "PNR": pnr,
+                    "Description": desc,
+                    "Effect Date": eff_date,
+                    "UNT": unt,
+                    "Price 2026": price_raw,
+                    "CUR": cur,
+                    "MOQ": moq,
+                    "SPQ": spq,
+                    "LTM": ltm,
+                }
+            )
+
+    return pd.DataFrame(rows)
+
+
+def read_pdf_vendor_dfs(pdf_bytes: bytes) -> List[pd.DataFrame]:
+    """
+    Decide el parser PDF según el contenido del PDF.
+    - IPECO / DIEHL: parseo por texto (pypdf)
+    - fallback: pdfplumber tables (read_pdf_tables)
+    """
+    first = _first_page_text_pypdf(pdf_bytes)
+
+    try:
+        if _looks_like_ipeco(first):
+            df = parse_pdf_ipeco(pdf_bytes)
+            if df is not None and not df.empty:
+                return [df]
+
+        if _looks_like_diehl(first):
+            df = parse_pdf_diehl(pdf_bytes)
+            if df is not None and not df.empty:
+                return [df]
+
+    except Exception as e:
+        # Si el parser específico falla, intentamos con tablas
+        print("[read_pdf_vendor_dfs] Parser específico falló, intentando tablas:", e)
+
+    # fallback: tablas
+    return [read_pdf_tables(pdf_bytes)]
+
 
 # ============================================================
 #  Helpers para precios por tramos
@@ -412,44 +712,19 @@ def detect_header_and_qty_ranges(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[s
     """
     Detecta la fila de encabezados y rangos de cantidad.
     Ajusta el DataFrame para que solo contenga datos y actualiza las columnas.
-
-    Mejora: evita falsos positivos (p.ej. filas tipo "Items on this list...")
-    exigiendo al menos 2 señales de cabecera (part/item number, description, price, currency).
     """
     header_row_idx = None
-
-    def _row_signals(lower_vals: List[str]) -> int:
-        has_part = any(("part" in v and "number" in v) for v in lower_vals)
-        has_itemnum = any(("item" in v and "number" in v) for v in lower_vals)
-        has_desc = any(("description" == v) or ("description" in v) for v in lower_vals)
-        has_price = any(("price" in v) for v in lower_vals)
-        has_curr = any(("currency" in v) or (v in ("usd", "eur", "euro")) for v in lower_vals)
-
-        score = 0
-        if has_part or has_itemnum:
-            score += 1
-        if has_desc:
-            score += 1
-        if has_price:
-            score += 1
-        if has_curr:
-            score += 1
-        return score
-
     for i, row in df.head(40).iterrows():
-        lower_vals = []
-        for v in row.values:
-            if isinstance(v, str):
-                vv = re.sub(r"\s+", " ", v.replace("\u00a0", " ")).strip().lower()
-                if vv:
-                    lower_vals.append(vv)
-
-        # Cabecera si detectamos >= 2 señales
-        if _row_signals(lower_vals) >= 2:
+        lower_vals = [str(v).strip().lower() for v in row.values if isinstance(v, str)]
+        has_part_header = any("part" in v and "number" in v for v in lower_vals)
+        has_description = "description" in lower_vals
+        has_item = any(v.startswith("item") for v in lower_vals)
+        if has_part_header or has_description or has_item:
             header_row_idx = i
             break
 
     qty_ranges_by_col_lower: Dict[str, str] = {}
+    start_data_idx = 0
     col_names: List[str] = []
 
     if header_row_idx is not None:
@@ -457,17 +732,12 @@ def detect_header_and_qty_ranges(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[s
         next_row = df.iloc[header_row_idx + 1] if header_row_idx + 1 < len(df) else None
 
         for idx, val in enumerate(header_row):
-            # Evitar columnas "nan" cuando hay merges o celdas vacías
-            if val is None or (isinstance(val, float) and pd.isna(val)) or (isinstance(val, str) and val.strip().lower() == "nan"):
-                raw_name = ""
-            else:
-                raw_name = str(val).strip()
-
+            raw_name = str(val).strip() if val is not None else ""
             if not raw_name:
                 raw_name = f"col_{idx}"
 
             col_name = raw_name
-            col_key_lower = re.sub(r"\s+", " ", raw_name.replace("\u00a0", " ")).strip().lower()
+            col_key_lower = raw_name.strip().lower()
 
             # Para columnas Qty/ea, añadimos el rango de la fila siguiente
             if next_row is not None and "qty/ea" in col_key_lower:
@@ -475,7 +745,7 @@ def detect_header_and_qty_ranges(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[s
                 if isinstance(vr, str) and vr.strip():
                     range_text = vr.strip()
                     col_name = f"{raw_name} {range_text}"  # p.ej. "Qty/ea 25-99"
-                    col_key_lower = re.sub(r"\s+", " ", col_name.replace("\u00a0", " ")).strip().lower()
+                    col_key_lower = col_name.strip().lower()
                     qty_ranges_by_col_lower[col_key_lower] = range_text
 
             col_names.append(col_name)
@@ -1145,17 +1415,8 @@ async def upload_catalog(
                     engine="openpyxl" if ext == ".xlsx" else None,
                 )
                 for sheet_name in excel_file.sheet_names:
-                    sn = str(sheet_name).strip().lower()
-                    # Evitar hojas de portada / administración / introducción, etc.
-                    if any(k in sn for k in ("readme", "read me", "header", "document", "administration", "introduction", "cover", "index", "contents")):
-                        continue
                     tmp_df = excel_file.parse(sheet_name)
                     if not tmp_df.empty:
-                        # Guardar nombre de hoja para trazabilidad
-                        try:
-                            tmp_df.attrs["sheet_name"] = sheet_name
-                        except Exception:
-                            pass
                         dfs.append(tmp_df)
             except Exception as e_openpyxl:
                 # Fallback solo para .xlsx (primera hoja)
@@ -1172,8 +1433,8 @@ async def upload_catalog(
                 dfs = [pd.read_csv(io.BytesIO(content), sep=None, engine="python")]
 
         elif ext == ".pdf":
-            # Caso STUKERJURGEN Hansair (y otros PDFs tabulares)
-            dfs = [read_pdf_tables(content)]
+            # PDFs: algunos son tabulares (pdfplumber) y otros requieren parseo por texto (pypdf)
+            dfs = read_pdf_vendor_dfs(content)
 
         else:
             raise HTTPException(
@@ -1201,18 +1462,12 @@ async def upload_catalog(
     # cache para no crear varios Part con el mismo código
     # clave: (catalog_id, supplier_id, part_number_full)
     part_cache: Dict[Tuple[int, int, str], models.Part] = {}
-    alias_cache: set[Tuple[int, str]] = set()  # (part_id, alias_code)
     inserted = 0
 
     # ===============================
     # Procesar cada hoja / tabla
     # ===============================
     for original_df in dfs:
-        sheet_name = None
-        try:
-            sheet_name = original_df.attrs.get("sheet_name")
-        except Exception:
-            pass
         if original_df.empty:
             continue
 
@@ -1229,27 +1484,42 @@ async def upload_catalog(
             "part number": "part_number", "part_number": "part_number", "part numbep": "part_number",
             "pn": "part_number", "p/n": "part_number", "part-no.": "part_number",
             "part-no": "part_number", "part no.": "part_number",
-            "cml item number": "part_number",  # CML
-            "rf part number": "part_number",   # COLLINS (tras limpiar \n)
-
 
             # Article / ArticleNo
             "articleno.": "article_no", "article no.": "article_no", "article no": "article_no",
-            "standard part number": "alias_code",
-
 
             # columnas ITEM (AIRTEC-BRAIDS)
             "item (standard)": "part_number", "item (other)": "part_number", "item": "part_number",
+
+
+            # --- NUEVOS PDFs / proveedores ---
+            # IPECO (PDF)
+            "material": "part_number",
+            "price (usd)": "price",
+            "uom": "unit_code", "uom.": "unit_code", "unit of measure": "unit_code",
+            "lead time (days)": "lead_time",
+            "of": "package_qty", "per": "per_qty",
+
+            # DIEHL (PDF)
+            "pnr": "part_number",
+            "price 2026": "price",
+            "cur": "currency",
+            "unt": "unit_code",
+            "moq": "min_qty",
+            "spq": "package_qty",
+            "ltm": "lead_time",
+
+            # COLLINS / equivalencias
+            "standard part number": "standard_part_number",
+            "rf part number": "rf_part_number",
+            "rf partnumber": "rf_part_number",
+            "rf part no": "rf_part_number",
 
             # descripción
             "descripcion": "description", "description": "description",
 
             # precio
             "price": "price", "precio": "price", "master $": "price",
-            "price each": "price",
-            "unit price": "price",
-            "unit price 2026": "price",
-
 
             # moneda
             "currency": "currency", "moneda": "currency",
@@ -1265,45 +1535,19 @@ async def upload_catalog(
         }
 
         normalized_cols: Dict[str, str] = {}
-        seen_names: Dict[str, int] = {}
-
         for col in df.columns:
-            raw_name = str(col).strip() if col is not None else ""
-            raw_name = raw_name.replace("\u00a0", " ")
-            col_key = re.sub(r"\s+", " ", raw_name).strip().lower()
-
-            mapped: str
+            raw_name = str(col).strip()
+            col_key = raw_name.lower()
 
             # 1) Mapeo exacto
             if col_key in column_map:
                 mapped = column_map[col_key]
 
-            # 2) Heurística: columnas que contienen 'part number' (COLLINS: 'RF\npart number', etc.)
-            elif "part number" in col_key:
-                if "standard" in col_key:
-                    mapped = "alias_code"
-                else:
-                    mapped = "part_number"
-
-            # 3) Heurística: 'item number' (CML: 'CML Item Number')
-            elif "item number" in col_key:
-                mapped = "part_number"
-
-            # 4) Heurística: precios (incluye símbolos € / $ o texto USD/EUR)
-            elif "unit price" in col_key or col_key.startswith("price"):
-                has_eur = ("€" in raw_name) or ("euro" in col_key) or (" eur" in col_key) or (" in €" in col_key)
-                has_usd = ("$" in raw_name) or ("usd" in col_key) or (" in $" in col_key)
-
-                if default_currency == "EUR":
-                    mapped = "price" if (has_eur or not has_usd) else "price_usd"
-                else:
-                    mapped = "price" if (has_usd or not has_eur) else "price_eur"
-
-            # 5) PANASONIC Master Price List: columnas tipo "Master S2 2023", etc.
+            # 2) PANASONIC Master Price List: columnas tipo "Master S2 2023", etc.
             elif "master" in col_key and ("s2" in col_key or "$" in col_key):
                 mapped = "price"
 
-            # 6) Variaciones de acumulado / lifecycle
+            # 3) Variaciones de acumulado / lifecycle
             elif "cumulative" in col_key:
                 mapped = "cumulative"
             elif "lifecycle" in col_key:
@@ -1311,11 +1555,6 @@ async def upload_catalog(
 
             else:
                 mapped = col_key
-
-            # Evitar columnas duplicadas (COLLINS 098 trae 2x Currency, etc.)
-            seen_names[mapped] = seen_names.get(mapped, 0) + 1
-            if seen_names[mapped] > 1:
-                mapped = f"{mapped}_{seen_names[mapped]}"
 
             normalized_cols[col] = mapped
 
@@ -1332,6 +1571,12 @@ async def upload_catalog(
             df["part_number"] = df["part_number"].replace("", None).ffill()
         if "article_no" in df.columns:
             df["article_no"] = df["article_no"].replace("", None).ffill()
+        if "rf_part_number" in df.columns:
+            df["rf_part_number"] = df["rf_part_number"].replace("", None).ffill()
+        if "standard_part_number" in df.columns:
+            df["standard_part_number"] = df["standard_part_number"].replace("", None).ffill()
+        if "supplier_part_no" in df.columns:
+            df["supplier_part_no"] = df["supplier_part_no"].replace("", None).ffill()
 
         # Columnas de precios por tramo (p.ej. "qty/ea 25-99", ...)
         tier_specs: List[Dict[str, Optional[int]]] = []
@@ -1352,7 +1597,11 @@ async def upload_catalog(
         for _, row in df.iterrows():
             # ---------- CÓDIGO DE PARTE ----------
             candidates = [
+                # Prioridad: RF -> Part Number -> Standard -> Article
+                row.get("rf_part_number"),
                 row.get("part_number"),
+                row.get("standard_part_number"),
+                row.get("supplier_part_no"),
                 row.get("article_no"),
                 row.get("part number"),
                 row.get("pn"),
@@ -1395,13 +1644,6 @@ async def upload_catalog(
                 if currency_val is not None and str(currency_val) != "nan"
                 else None
             )
-            # Normalizar monedas (COLLINS usa 'EURO')
-            if currency:
-                if currency in ("EURO", "EUROS"):
-                    currency = "EUR"
-                elif currency in ("US$", "US DOLLAR", "USDOLLAR"):
-                    currency = "USD"
-
 
             # ---------- CANTIDAD MÍNIMA ----------
             min_qty = row.get("min_qty")
@@ -1471,30 +1713,51 @@ async def upload_catalog(
                 part_cache[cache_key] = part
                 inserted += 1
                 is_new_part = True
-                # --------- ALIASES (Standard part number, etc.) ---------
-                alias_val = row.get("alias_code")
-                if alias_val is not None and str(alias_val) != "nan" and str(alias_val).strip():
-                    for ac in re.split(r"[\n,;/]+", str(alias_val)):
-                        ac = ac.strip()
-                        if not ac:
-                            continue
-                        if ac == part.part_number_full:
-                            continue
-                        key = (part.id, ac)
-                        if key in alias_cache:
-                            continue
-                        alias_cache.add(key)
-                        try:
-                            db.add(models.PartAlias(part_id=part.id, code=ac, source="ALIAS"))
-                        except Exception:
-                            pass
 
-                # --------- TRAZABILIDAD: hoja original ---------
-                if sheet_name:
-                    try:
-                        db.add(models.PartAttribute(part_id=part.id, attr_name="Hoja Original", attr_value=str(sheet_name)))
-                    except Exception:
-                        pass
+
+            # --------- ALIASES / CÓDIGOS EQUIVALENTES ---------
+            # Permite buscar por "standard part number" y encontrar el RF (y viceversa).
+            if is_new_part:
+                alias_values: List[Any] = []
+
+                # campos conocidos (cuando existan)
+                alias_values.extend([
+                    row.get("standard_part_number"),
+                    row.get("rf_part_number"),
+                    row.get("supplier_part_no"),
+                ])
+
+                # si el part_number "visible" no fue el principal, lo agregamos como alias
+                alias_values.append(row.get("part_number"))
+                alias_values.append(row.get("article_no"))
+
+                # columnas genéricas que contengan la palabra "alias"/"alternate"
+                for col_name, value in row.items():
+                    norm_name = normalized_cols.get(col_name, str(col_name).strip().lower())
+                    if any(k in norm_name for k in ("alias", "alternate", "equivalent", "equivalente", "alt " , " alt", "alt_pn")):
+                        alias_values.append(value)
+
+                main_norm = normalize_pn(part.part_number_full)
+                seen_alias_norms: set = set()
+
+                for raw_alias in alias_values:
+                    for code_alias in extract_alias_codes(raw_alias):
+                        if not code_alias:
+                            continue
+                        if normalize_pn(code_alias) == main_norm:
+                            continue
+                        norm = normalize_pn(code_alias)
+                        if norm in seen_alias_norms:
+                            continue
+                        seen_alias_norms.add(norm)
+
+                        db.add(
+                            models.PartAlias(
+                                part_id=part.id,
+                                code=str(code_alias).strip(),
+                                source="AUTO_ALIAS",
+                            )
+                        )
 
             # --------- PRICE TIERS (rangos / cantidades) ---------
             if tier_prices:
