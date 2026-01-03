@@ -172,6 +172,19 @@ def normalize_pn(s: str) -> str:
     return _norm_re.sub("", str(s).upper().strip())
 
 
+def json_safe_number(v: Any) -> Any:
+    """Evita NaN/Inf en respuestas JSON (provocan 500 en FastAPI/Starlette)."""
+    try:
+        import math
+        if v is None:
+            return None
+        if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+            return None
+    except Exception:
+        pass
+    return v
+
+
 
 def extract_alias_codes(raw: Optional[str]) -> List[str]:
     """
@@ -919,7 +932,14 @@ def parse_pdf_stuker_sac(pdf_bytes: bytes) -> pd.DataFrame:
 
                 # intentar extraer variante + descripción + (length) + (min_qty) + (uom)
                 tail = toks[2:]
-                # buscar el último token numérico (largo)
+
+                # extraer unidad al final (ej: m, St., EA) si existe
+                unit_code = None
+                if tail and re.fullmatch(r"[A-Za-z\.]{1,6}", tail[-1]):
+                    unit_code = tail[-1]
+                    tail = tail[:-1]
+
+                # buscar largo (mm) al final si existe
                 length_mm = None
                 for j in range(len(tail) - 1, -1, -1):
                     if re.fullmatch(r"\d+(?:[\.,]\d+)?", tail[j]):
@@ -955,7 +975,7 @@ def parse_pdf_stuker_sac(pdf_bytes: bytes) -> pd.DataFrame:
                         "description": description,
                         "length_mm": length_mm,
                         "min_qty": None,
-                        "unit_code": None,
+                        "unit_code": unit_code,
                         "price": None,
                         "currency": "EUR",
                         "pricing_note": "on request",
@@ -1424,6 +1444,17 @@ def parse_price_value(price_value) -> Optional[float]:
     Soporta formatos con €, $, comas, etc.
     Ignora textos como 'Price and Leadtime on request.'.
     """
+    # Pandas / numpy NaN (y equivalentes) rompen JSON (NaN no es JSON-compliant)
+    # y además no representan un precio real.
+    # Evitamos que se cuele `float('nan')` (por ejemplo cuando viene de un DataFrame).
+    try:
+        import math
+        if isinstance(price_value, float) and math.isnan(price_value):
+            return None
+    except Exception:
+        pass
+
+    # pandas puede entregar "<NA>" o strings tipo "nan"
     if price_value is None:
         return None
 
@@ -1431,8 +1462,16 @@ def parse_price_value(price_value) -> Optional[float]:
     if not s:
         return None
 
+    if s.lower() in ("nan", "none", "null", "<na>"):
+        return None
+
     # Caso texto especial (AIRTEC, etc.)
     if s.lower().startswith("price and leadtime"):
+        return None
+
+    # Caso STUKERJURGEN / otros: "on request"
+    low = s.lower()
+    if "on request" in low or low in ("onrequest", "on-request", "request"):
         return None
 
     # quitar símbolos y espacios
@@ -2579,6 +2618,16 @@ async def upload_catalog(
             tier_prices: List[Tuple[Optional[int], Optional[int], float]] = []
             pricing_note: Optional[str] = None
 
+            # Si el campo price trae texto (ej: "on request"), lo guardamos como nota
+            raw_price_text = row.get("price")
+            if (
+                base_price is None
+                and isinstance(raw_price_text, str)
+                and raw_price_text.strip()
+                and "on request" in raw_price_text.lower()
+            ):
+                pricing_note = raw_price_text.strip()
+
             for spec in tier_specs:
                 col_name = spec["col"]
                 if col_name not in row:
@@ -2606,7 +2655,12 @@ async def upload_catalog(
                 )
                 base_price = tier_prices_sorted[0][2]
 
-            # --------- UNIFICAR PARTS POR CÓDIGO ---------
+                        # Nota de precio proveniente del parser PDF (ej: STUKERJURGEN "on request")
+            row_note = row.get("pricing_note")
+            if pricing_note is None and row_note is not None and str(row_note) != "nan":
+                pricing_note = str(row_note).strip()
+
+# --------- UNIFICAR PARTS POR CÓDIGO ---------
             cache_key = (catalog.id, supplier.id, part_number_full)
             part = part_cache.get(cache_key)
 
@@ -2699,7 +2753,7 @@ async def upload_catalog(
                     (min_qty is not None and str(min_qty) != "nan")
                     or (max_qty is not None and str(max_qty) != "nan")
                 )
-                if has_qty_info or base_price is not None:
+                if base_price is not None:
                     pt = models.PriceTier(
                         part_id=part.id,
                         min_qty=min_qty_default,
@@ -2708,7 +2762,7 @@ async def upload_catalog(
                             if max_qty is not None and str(max_qty) != "nan"
                             else None
                         ),
-                        unit_price=base_price if base_price is not None else 0.0,
+                        unit_price=base_price,
                         currency=currency or default_currency,
                     )
                     db.add(pt)
@@ -2855,7 +2909,7 @@ def search_parts(
             "part_number_root": part.part_number_root,
             "description": part.description,
             "currency": part.currency,
-            "base_price": part.base_price,
+            "base_price": json_safe_number(part.base_price),
             "min_qty_default": part.min_qty_default,
             "catalog_id": part.catalog_id,
             "supplier_id": part.supplier_id,
@@ -2865,7 +2919,7 @@ def search_parts(
                     "id": pt.id,
                     "min_qty": pt.min_qty,
                     "max_qty": pt.max_qty,
-                    "unit_price": pt.unit_price,
+                    "unit_price": json_safe_number(pt.unit_price),
                     "currency": pt.currency,
                 }
                 for pt in getattr(part, "price_tiers", [])
