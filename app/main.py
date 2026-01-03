@@ -2377,6 +2377,25 @@ async def upload_catalog(
             # IPECO (PDF)
             "material": "part_number",
             "price (usd)": "price",
+            # KEDDEG / otros: "Distributor Net Price"
+            "distributor net price": "price",
+            "distributor price": "price",
+            "net price": "price",
+
+            # Lufthansa Technik / genérico
+            "price in eur": "price",
+            "price in usd": "price",
+            "price (eur)": "price",
+
+            # MOQ / Leadtime variantes
+            "min order qty": "min_qty",
+            "min order qty.": "min_qty",
+            "min order quantity": "min_qty",
+            "minimum order qty": "min_qty",
+            "minimum order quantity": "min_qty",
+            "lead-time in weeks": "lead_time",
+            "lead time in weeks": "lead_time",
+            "leadtime in weeks": "lead_time",
             "uom": "unit_code", "uom.": "unit_code", "unit of measure": "unit_code",
             "lead time (days)": "lead_time",
             "of": "package_qty", "per": "per_qty",
@@ -2708,7 +2727,7 @@ async def upload_catalog(
                 # columnas genéricas que contengan la palabra "alias"/"alternate"
                 for col_name, value in row.items():
                     norm_name = normalized_cols.get(col_name, str(col_name).strip().lower())
-                    if any(k in norm_name for k in ("alias", "alternate", "equivalent", "equivalente", "alt " , " alt", "alt_pn")):
+                    if any(k in norm_name for k in ("alias", "alternate", "equivalent", "equivalente", "alt ", " alt", "alt_pn")) or ("oem" in norm_name and ("part" in norm_name or "pn" in norm_name or "number" in norm_name)):
                         alias_values.append(value)
 
                 main_norm = normalize_pn(part.part_number_full)
@@ -2910,15 +2929,15 @@ def search_parts(
             "description": part.description,
             "currency": part.currency,
             "base_price": json_safe_number(part.base_price),
-            "min_qty_default": part.min_qty_default,
+            "min_qty_default": json_safe_number(part.min_qty_default),
             "catalog_id": part.catalog_id,
             "supplier_id": part.supplier_id,
             "supplier_name": supplier.name,
             "price_tiers": [
                 {
                     "id": pt.id,
-                    "min_qty": pt.min_qty,
-                    "max_qty": pt.max_qty,
+                    "min_qty": json_safe_number(pt.min_qty),
+                    "max_qty": json_safe_number(pt.max_qty),
                     "unit_price": json_safe_number(pt.unit_price),
                     "currency": pt.currency,
                 }
