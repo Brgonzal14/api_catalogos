@@ -1563,6 +1563,10 @@ def detect_header_and_qty_ranges(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[s
 
     part_markers = (
         "part number", "part no", "part-no", "part_number", "p/n", "pn",
+        # IPECO (Excel/PDF) usa "Material" como identificador del part number
+        "material", "material number", "material no", "material #",
+        # Otros proveedores
+        "pnr",
         "art.-nr", "art.nr", "bauteil", "bauteil-nr",
     )
     desc_markers = ("description", "bezeichnung", "desc")
