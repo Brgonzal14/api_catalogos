@@ -358,7 +358,6 @@ def read_pdf_tables(pdf_bytes: bytes) -> pd.DataFrame:
 
     max_len = max(len(r) for r in all_rows)
     norm_rows = [r + [None] * (max_len - len(r)) for r in all_rows]
-
     return pd.DataFrame(norm_rows)
 
 # ============================================================
@@ -592,6 +591,435 @@ def parse_pdf_diehl(pdf_bytes: bytes) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+
+# ============================================================
+#  Helpers PDF (vendor-specific): AES / MATZEN & TIMM / STABILUS / STUKERJURGEN SAC / VINCORION
+#  Nota: algunos de estos PDFs no exponen tablas a pdfplumber, por lo que se parsean por texto.
+# ============================================================
+
+def _looks_like_aes(text: str) -> bool:
+    t = (text or "").lower()
+    return ("distributor" in t and "price list" in t and "part number" in t)
+
+def _looks_like_matzen(text: str) -> bool:
+    t = (text or "").lower()
+    return ("matzen" in t and "timm" in t) or ("matzen & timm" in t)
+
+def _looks_like_stabilus(text: str) -> bool:
+    t = (text or "").lower()
+    # Alemán: "Preisliste", "Sonderpreisliste"
+    return ("stabilus" in t) or ("sonderpreisliste" in t) or ("preisliste" in t and "art.-nr" in t)
+
+def _looks_like_stuker_sac(text: str) -> bool:
+    t = (text or "").lower()
+    return ("sac products" in t) or ("bauteil-nr" in t) or ("bezeichnung" in t and "länge" in t)
+
+def _looks_like_vincorion(text: str) -> bool:
+    t = (text or "").lower()
+    return ("vincorion" in t) or ("annual price catalogue" in t and "spare parts" in t)
+
+def parse_pdf_aes(pdf_bytes: bytes) -> pd.DataFrame:
+    """AES Distributor price list (PDF con tablas)."""
+    try:
+        import pdfplumber
+        tables_rows = []
+        header = None
+        for page_idx in range(0, 10):  # suficiente para captar la lista
+            with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+                if page_idx >= len(pdf.pages):
+                    break
+                page = pdf.pages[page_idx]
+                tables = page.extract_tables() or []
+                for table in tables:
+                    for row in table:
+                        # normaliza celdas
+                        row = [c.strip() if isinstance(c, str) else c for c in row]
+                        # detecta header real
+                        if row and any(isinstance(c, str) and c.strip().lower() == "part number" for c in row):
+                            header = row
+                            continue
+                        if header is None:
+                            continue
+                        # filas de datos: primera celda debe parecer P/N (no vacía)
+                        if not row or row[0] is None:
+                            continue
+                        first = str(row[0]).strip()
+                        if not first or first.lower().startswith("distributor"):
+                            continue
+                        tables_rows.append(row)
+        if not header or not tables_rows:
+            # fallback genérico
+            return read_pdf_tables(pdf_bytes)
+
+        # Ajustar longitudes
+        max_len = max(len(r) for r in ([header] + tables_rows))
+        def _pad(r): return r + [None] * (max_len - len(r))
+        header = _pad(header)
+        tables_rows = [_pad(r) for r in tables_rows]
+
+        cols = []
+        for c in header:
+            c = (str(c).replace("\n", " ").strip() if c is not None else "")
+            cols.append(c if c else f"col_{len(cols)}")
+
+        df = pd.DataFrame(tables_rows, columns=cols)
+
+        # estandarizar nombres clave (sin perder info: quedará como atributos también)
+        rename = {}
+        for c in df.columns:
+            lc = str(c).lower()
+            if lc == "part number":
+                rename[c] = "part_number"
+            elif "description" in lc:
+                rename[c] = "description"
+            elif "price" in lc:
+                rename[c] = "price"
+            elif lc.strip() == "moq":
+                rename[c] = "min_qty"
+            elif "certificate" in lc:
+                rename[c] = "certificate"
+            elif "length in inch" in lc:
+                rename[c] = "length_inch"
+            elif "length in cm" in lc:
+                rename[c] = "length_cm"
+        return df.rename(columns=rename)
+
+    except Exception:
+        # fallback genérico
+        return read_pdf_tables(pdf_bytes)
+
+def parse_pdf_matzen(pdf_bytes: bytes) -> pd.DataFrame:
+    """MATZEN & TIMM (AIRBUS): Airbus P/N principal y Supplier P/N como alias."""
+    try:
+        import pdfplumber
+        rows = []
+        header = None
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            for page in pdf.pages:
+                tables = page.extract_tables() or []
+                for table in tables:
+                    for row in table:
+                        row = [c.strip() if isinstance(c, str) else c for c in row]
+                        # header contiene "Customer P/N" y "Description"
+                        if row and any(isinstance(c, str) and "customer p/n" in c.lower() for c in row) and any(isinstance(c, str) and "description" in c.lower() for c in row):
+                            header = row
+                            continue
+                        if header is None:
+                            continue
+                        if not row or row[0] is None:
+                            continue
+                        # ignora paginación / títulos
+                        if isinstance(row[0], str) and row[0].lower().startswith("spare parts"):
+                            continue
+                        rows.append(row)
+
+        if not header or not rows:
+            return read_pdf_tables(pdf_bytes)
+
+        max_len = max(len(r) for r in ([header] + rows))
+        def _pad(r): return r + [None] * (max_len - len(r))
+        header = _pad(header)
+        rows = [_pad(r) for r in rows]
+
+        cols = []
+        for c in header:
+            c = (str(c).replace("\n", " ").strip() if c is not None else "")
+            cols.append(c if c else f"col_{len(cols)}")
+
+        df = pd.DataFrame(rows, columns=cols)
+
+        # Renames: Airbus PN principal
+        rename = {}
+        for c in df.columns:
+            lc = str(c).lower()
+            if "customer p/n" in lc:
+                rename[c] = "part_number"  # AIRBUS P/N
+            elif "m&t p/n" in lc or "m&t" in lc and "p/n" in lc:
+                rename[c] = "supplier_part_no"  # alias
+            elif lc.strip() == "customer":
+                rename[c] = "customer"
+            elif "description" in lc:
+                rename[c] = "description"
+            elif "ata" in lc:
+                rename[c] = "ata_chapter"
+            elif "shelf" in lc:
+                rename[c] = "shelf_life"
+            elif "price" in lc:
+                rename[c] = "price"
+            elif "pack" in lc and "size" in lc:
+                rename[c] = "pack_qty"
+            elif "qty" in lc and "pack" in lc:
+                rename[c] = "pack_qty"
+        return df.rename(columns=rename)
+
+    except Exception:
+        return read_pdf_tables(pdf_bytes)
+
+def parse_pdf_stabilus(pdf_bytes: bytes) -> pd.DataFrame:
+    """STABILUS (Preisliste): filas por tramo (ab Menge / VK)."""
+    try:
+        import pdfplumber
+        items = {}  # pn -> list[(min_qty, price)]
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            for page in pdf.pages:
+                tables = page.extract_tables() or []
+                for table in tables:
+                    # detectar header
+                    header_idx = None
+                    for i, row in enumerate(table[:5]):
+                        if not row:
+                            continue
+                        low = " ".join([str(c).lower() for c in row if c is not None])
+                        if "art" in low and "nr" in low and ("vk" in low or "menge" in low):
+                            header_idx = i
+                            break
+                    if header_idx is None:
+                        continue
+                    header = table[header_idx]
+                    # column indexes
+                    col_map = {}
+                    for j, c in enumerate(header):
+                        lc = (str(c).lower() if c is not None else "")
+                        if "art" in lc and "nr" in lc:
+                            col_map["pn"] = j
+                        elif "ab" in lc and "menge" in lc:
+                            col_map["min"] = j
+                        elif "vk" in lc:
+                            col_map["price"] = j
+                    if "pn" not in col_map or "min" not in col_map or "price" not in col_map:
+                        continue
+
+                    for row in table[header_idx+1:]:
+                        if not row or len(row) <= max(col_map.values()):
+                            continue
+                        pn = row[col_map["pn"]]
+                        min_q = row[col_map["min"]]
+                        pr = row[col_map["price"]]
+                        if pn is None:
+                            continue
+                        pn = str(pn).strip()
+                        if not pn or pn.lower().startswith("art"):
+                            continue
+                        # limpiar min qty
+                        min_qty = None
+                        if min_q is not None:
+                            m = re.search(r"\d+", str(min_q))
+                            if m:
+                                min_qty = int(m.group(0))
+                        price = parse_price_value(pr)
+                        if min_qty is None and price is None:
+                            continue
+                        items.setdefault(pn, [])
+                        if min_qty is None:
+                            min_qty = 1
+                        if price is not None:
+                            items[pn].append((min_qty, price))
+
+        rows = []
+        for pn, tiers in items.items():
+            tiers = sorted({(mq, pr) for mq, pr in tiers}, key=lambda x: x[0])
+            for idx, (mq, pr) in enumerate(tiers):
+                next_mq = tiers[idx+1][0] if idx+1 < len(tiers) else None
+                max_qty = (next_mq - 1) if next_mq is not None else None
+                rows.append({
+                    "part_number": pn,
+                    "min_qty": mq,
+                    "max_qty": max_qty,
+                    "price": pr,
+                    "currency": "EUR",
+                })
+        return pd.DataFrame(rows)
+
+    except Exception:
+        return pd.DataFrame()
+
+def _parse_qty_token(token: str) -> Tuple[Optional[int], Optional[str]]:
+    """Token tipo '100St.' / '100,0' -> (100, 'St.')"""
+    if token is None:
+        return (None, None)
+    s = str(token).strip()
+    if not s:
+        return (None, None)
+    m = re.match(r"^(?P<qty>\d+(?:[\.,]\d+)?)\s*(?P<u>[A-Za-z\.]+)?$", s)
+    if not m:
+        return (None, None)
+    qty_raw = m.group("qty")
+    u = m.group("u")
+    # qty
+    try:
+        q = float(qty_raw.replace(".", "").replace(",", "."))
+        qty_i = int(round(q))
+        return (qty_i, u)
+    except Exception:
+        return (None, u)
+
+def parse_pdf_stuker_sac(pdf_bytes: bytes) -> pd.DataFrame:
+    """STUKERJURGEN SAC Products: parseo por texto (alemán)"""
+    rows = []
+    try:
+        for page_text in _iter_text_pages_pypdf(pdf_bytes):
+            if not page_text:
+                continue
+            for line in page_text.splitlines():
+                raw = (line or "").strip()
+                if not raw:
+                    continue
+                low = raw.lower()
+                if low.startswith("p/n") or "bauteil-nr" in low or "variante" in low or "bezeichnung" in low:
+                    continue
+                if not re.match(r"^\d{4,}\s+", raw):
+                    continue
+
+                # normaliza typos comunes
+                raw = re.sub(r"\bmon\s+request\b", "on request", raw, flags=re.IGNORECASE)
+
+                # extraer precio al final (con posible unidad pegada: 'm36,10', o qty+unit+price: '100St.22,75')
+                m = re.search(r"(?P<pre>[A-Za-z\.]*)(?P<price>\d+(?:\.\d{3})*(?:,\d+)?)\s*$", raw)
+                if not m:
+                    # on request
+                    if "on request" in low:
+                        # intentamos igualmente sacar los campos básicos
+                        tokens = raw.split()
+                        if len(tokens) < 6:
+                            continue
+                        pn = tokens[0]
+                        supplier = tokens[1]
+                        variant = tokens[2]
+                        # asume length y qty al final
+                        length = tokens[-2]
+                        qty_token = tokens[-1]
+                        qty_i, qty_u = _parse_qty_token(qty_token)
+                        desc = " ".join(tokens[3:-2]).strip()
+                        rows.append({
+                            "part_number": pn,
+                            "supplier_part_no": supplier,
+                            "variant": variant,
+                            "description": desc,
+                            "length_mm": length,
+                            "min_qty": qty_i,
+                            "uom": qty_u,
+                            "pricing_note": "on request",
+                            "currency": "EUR",
+                        })
+                    continue
+
+                pre = (m.group("pre") or "").strip()
+                price_raw = (m.group("price") or "").strip()
+                line_wo_price = raw[:m.start()].rstrip()
+
+                unit_from_price = pre if pre else None
+
+                tokens = line_wo_price.split()
+                if len(tokens) < 6:
+                    continue
+
+                pn = tokens[0]
+                supplier = tokens[1]
+                variant = tokens[2]
+
+                qty_token = tokens[-1]
+                length = tokens[-2]
+
+                qty_i, qty_u = _parse_qty_token(qty_token)
+                uom = unit_from_price or qty_u
+
+                desc = " ".join(tokens[3:-2]).strip()
+
+                price = parse_price_value(price_raw)
+                if price is None:
+                    continue
+
+                rows.append({
+                    "part_number": pn,
+                    "supplier_part_no": supplier,
+                    "variant": variant,
+                    "description": desc,
+                    "length_mm": length,
+                    "min_qty": qty_i,
+                    "uom": uom,
+                    "price": price,
+                    "currency": "EUR",
+                })
+        return pd.DataFrame(rows)
+    except Exception:
+        return pd.DataFrame(rows)
+
+def parse_pdf_vincorion(pdf_bytes: bytes) -> pd.DataFrame:
+    """VINCORION Airbus spares: parseo por texto (ATA | Partnumber | Designation | Lead Time | Price US-$)."""
+    rows = []
+    try:
+        header_seen = False
+        for page_text in _iter_text_pages_pypdf(pdf_bytes):
+            if not page_text:
+                continue
+            for line in page_text.splitlines():
+                raw = (line or "").strip()
+                if not raw:
+                    continue
+                low = raw.lower()
+
+                if "ata partnumber designation of item lead time price" in low:
+                    header_seen = True
+                    continue
+                if not header_seen:
+                    continue
+
+                # cortar cuando viene otro bloque
+                if low.startswith("annual price catalogue"):
+                    continue
+                if "replacements" in low and "ata" not in low:
+                    continue
+                if low.startswith("control units") or low.startswith("hydraulic") or low.startswith("electrical"):
+                    # títulos de sección
+                    continue
+
+                # líneas válidas empiezan con ATA (2 dígitos)
+                m = re.match(r"^(?P<ata>\d{2})\s+(?P<pn>[A-Za-z0-9\-\/]+)\s+(?P<rest>.+)$", raw)
+                if not m:
+                    continue
+                ata = m.group("ata")
+                pn = m.group("pn").strip()
+                rest = m.group("rest").strip()
+
+                # precio: último token numérico
+                toks = rest.split()
+                if not toks:
+                    continue
+                price_token = toks[-1]
+                price = parse_price_value(price_token)
+                if price is None:
+                    continue
+                rest_wo_price = " ".join(toks[:-1]).strip()
+
+                lead_time = None
+                # buscar "on request"
+                if re.search(r"\bon\s+request\b", rest_wo_price, flags=re.IGNORECASE):
+                    lead_time = "on request"
+                    desc = re.sub(r"\bon\s+request\b", "", rest_wo_price, flags=re.IGNORECASE).strip()
+                else:
+                    mlt = re.search(r"(\d+\s*(?:day|days|week|weeks|month|months))", rest_wo_price, flags=re.IGNORECASE)
+                    if mlt:
+                        lead_time = mlt.group(1)
+                        desc = rest_wo_price[:mlt.start()].strip()
+                    else:
+                        desc = rest_wo_price
+
+                rows.append({
+                    "ata": ata,
+                    "part_number": pn,
+                    "description": desc,
+                    "lead_time": lead_time,
+                    "price": price,
+                    "currency": "USD",
+                })
+
+        return pd.DataFrame(rows)
+    except Exception:
+        return pd.DataFrame(rows)
+
+
+
+
 def read_pdf_vendor_dfs(pdf_bytes: bytes) -> List[pd.DataFrame]:
     """
     Decide el parser PDF según el contenido del PDF.
@@ -600,7 +1028,18 @@ def read_pdf_vendor_dfs(pdf_bytes: bytes) -> List[pd.DataFrame]:
     """
     first = _first_page_text_pypdf(pdf_bytes)
 
+    # Algunos PDFs (p.ej. TDI) extraen mejor texto con pdfplumber.
+    pl_text = _first_page_text_pdfplumber(pdf_bytes)
+    if pl_text and (len(pl_text.strip()) > len((first or "").strip())):
+        first = pl_text
+
     try:
+        # TDI (Meridian / Spectrum) - PDF por texto
+        if _looks_like_tdi(first):
+            df = parse_pdf_tdi(pdf_bytes)
+            if df is not None and not df.empty:
+                return [df]
+
         if _looks_like_ipeco(first):
             df = parse_pdf_ipeco(pdf_bytes)
             if df is not None and not df.empty:
@@ -611,12 +1050,211 @@ def read_pdf_vendor_dfs(pdf_bytes: bytes) -> List[pd.DataFrame]:
             if df is not None and not df.empty:
                 return [df]
 
+        # Nuevos proveedores 2026 (PDF):
+        if _looks_like_aes(first):
+            df = parse_pdf_aes(pdf_bytes)
+            if df is not None and not df.empty:
+                return [df]
+
+        if _looks_like_matzen(first):
+            df = parse_pdf_matzen(pdf_bytes)
+            if df is not None and not df.empty:
+                return [df]
+
+        if _looks_like_stabilus(first):
+            df = parse_pdf_stabilus(pdf_bytes)
+            if df is not None and not df.empty:
+                return [df]
+
+        if _looks_like_stuker_sac(first):
+            df = parse_pdf_stuker_sac(pdf_bytes)
+            if df is not None and not df.empty:
+                return [df]
+
+        if _looks_like_vincorion(first):
+            df = parse_pdf_vincorion(pdf_bytes)
+            if df is not None and not df.empty:
+                return [df]
+
     except Exception as e:
         # Si el parser específico falla, intentamos con tablas
         print("[read_pdf_vendor_dfs] Parser específico falló, intentando tablas:", e)
 
     # fallback: tablas
     return [read_pdf_tables(pdf_bytes)]
+
+
+
+# ============================================================
+#  Helpers de normalización extra (columnas duplicadas / tiers por encabezado)
+# ============================================================
+def dedupe_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Asegura nombres de columnas únicos (pandas permite duplicados y rompe .get / ffill)."""
+    cols = []
+    counts: Dict[str, int] = {}
+    for c in list(df.columns):
+        base = str(c)
+        n = counts.get(base, 0) + 1
+        counts[base] = n
+        cols.append(base if n == 1 else f"{base}__{n}")
+    df.columns = cols
+    return df
+
+_tier_range_re = re.compile(r"^\s*(\d+)\s*-\s*(\d+)\s*$")
+_tier_num_re = re.compile(r"^\s*(\d+)\s*$")
+
+def parse_tier_header(header: Any) -> Tuple[Optional[int], Optional[int]]:
+    """Interpreta encabezados tipo '5-9', '10 - 24' o '500' como tramos de precios."""
+    if header is None:
+        return (None, None)
+    if isinstance(header, (int, float)) and not pd.isna(header):
+        # 500.0 -> 500
+        if float(header).is_integer():
+            header = str(int(header))
+        else:
+            header = str(header)
+    s = str(header).strip()
+    if not s:
+        return (None, None)
+    # 5-9
+    m = _tier_range_re.match(s)
+    if m:
+        return (int(m.group(1)), int(m.group(2)))
+    # 500  -> asumimos >=500 (max None)
+    m = _tier_num_re.match(s)
+    if m:
+        return (int(m.group(1)), None)
+    return (None, None)
+
+_moq_re = re.compile(r"\bmoq\b[^0-9]*(\d+)", flags=re.IGNORECASE)
+
+def parse_moq_from_text(raw: Any) -> Optional[int]:
+    """Extrae MOQ desde texto tipo 'MOQ 100 EA' / 'MOQ: 10'"""
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s or s.lower() == "nan":
+        return None
+    m = _moq_re.search(s)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except Exception:
+        return None
+
+
+# ============================================================
+#  Helpers PDF (vendor-specific): TDI (PDF por texto, no tablas)
+# ============================================================
+def _first_page_text_pdfplumber(pdf_bytes: bytes) -> str:
+    try:
+        import pdfplumber
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            if not pdf.pages:
+                return ""
+            return (pdf.pages[0].extract_text() or "")
+    except Exception:
+        return ""
+
+def _looks_like_tdi(text: str) -> bool:
+    t = (text or "").lower()
+    return ("torrington" in t) or ("tdi" in t and "pricing" in t) or ("meridian" in t and "pricing" in t)
+
+def parse_pdf_tdi(pdf_bytes: bytes) -> pd.DataFrame:
+    """
+    TDI Meridian / Spectrum (PDF):
+    Extrae desde texto con pdfplumber:
+      Part Number | Part Description | Seat Model | Aircraft | Leadtime | Unit | Sales Price | Min Buy
+    """
+    try:
+        import pdfplumber
+    except ImportError as e:
+        raise HTTPException(status_code=500, detail=f"Falta pdfplumber para leer PDF TDI: {e}")
+
+    rows: List[Dict[str, Any]] = []
+    pn_re = re.compile(r"^[A-Z0-9]+(?:[-/][A-Z0-9]+)*$")
+
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for page in pdf.pages:
+            page_text = page.extract_text() or ""
+            if not page_text:
+                continue
+            for line in page_text.splitlines():
+                s = (line or "").strip()
+                if not s:
+                    continue
+
+                low = s.lower()
+                # saltar títulos/cabeceras/notes
+                if low.startswith("torrington") or "pricing" in low and "part number" in low:
+                    continue
+                if low.startswith("page ") or low.startswith("tdi standard"):
+                    continue
+                if low.startswith("part number") or low.startswith("part description"):
+                    continue
+
+                tokens = s.split()
+                if len(tokens) < 6:
+                    continue
+
+                pn = tokens[0].strip()
+                if not pn_re.match(pn):
+                    continue
+
+                # desde el final: min buy, price, unit
+                min_buy = tokens[-1] if tokens[-1].isdigit() else None
+                price_raw = tokens[-2] if len(tokens) >= 2 else None
+                unit = tokens[-3] if len(tokens) >= 3 else None
+
+                if min_buy is None:
+                    continue
+                if parse_price_value(price_raw) is None:
+                    continue
+
+                # leadtime: buscamos 'days' o 'weeks'
+                lead_idx = None
+                for i in range(len(tokens) - 4, 0, -1):
+                    if tokens[i].lower() in ("days", "day", "weeks", "week"):
+                        lead_idx = i
+                        break
+
+                leadtime = None
+                seat_model = None
+                aircraft = None
+
+                if lead_idx is not None:
+                    # ejemplo: "100 Business Days"
+                    lead_start = max(1, lead_idx - 2)
+                    leadtime = " ".join(tokens[lead_start:lead_idx + 1]).strip()
+
+                    pre = tokens[:lead_start]  # pn + desc + seat/aircraft...
+                    if len(pre) >= 3:
+                        seat_model = pre[-2]
+                        aircraft = pre[-1]
+                        desc_tokens = pre[1:-2]
+                    elif len(pre) == 2:
+                        desc_tokens = pre[1:]
+                    else:
+                        desc_tokens = []
+                else:
+                    # fallback: asumimos que el texto entre PN y los 3 últimos tokens es descripción
+                    desc_tokens = tokens[1:-3]
+
+                description = " ".join(desc_tokens).strip()
+
+                rows.append({
+                    "Part Number": pn,
+                    "Part Description": description,
+                    "Seat Model": seat_model,
+                    "Aircraft": aircraft,
+                    "Leadtime": leadtime,
+                    "Unit": unit,
+                    "Sales Price": price_raw,
+                    "Min Buy": min_buy,
+                })
+
+    return pd.DataFrame(rows)
 
 
 # ============================================================
@@ -732,7 +1370,14 @@ def detect_header_and_qty_ranges(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[s
         next_row = df.iloc[header_row_idx + 1] if header_row_idx + 1 < len(df) else None
 
         for idx, val in enumerate(header_row):
-            raw_name = str(val).strip() if val is not None else ""
+            # Normalizar encabezados numéricos (ej: 500.0 -> 500)
+            if val is not None and isinstance(val, (int, float)) and not pd.isna(val):
+                if float(val).is_integer():
+                    raw_name = str(int(val))
+                else:
+                    raw_name = str(val).strip()
+            else:
+                raw_name = str(val).strip() if val is not None else ""
             if not raw_name:
                 raw_name = f"col_{idx}"
 
@@ -1529,6 +2174,24 @@ async def upload_catalog(
             "to qty": "max_qty", "max qty": "max_qty",
             "quantity": "min_qty", "qty": "min_qty",
 
+
+            # --- NUEVOS XLSX (PUROLATOR / SAFRAN) ---
+            "partnumber": "part_number",
+            "lead-time": "lead_time", "leadtime": "lead_time",
+            "stock ref": "stock_ref", "stock ref.": "stock_ref",
+            "safran stock ref.": "stock_ref",
+            "comments": "comments", "comment": "comments", "remarks": "comments", "remark": "comments",
+            "uon": "unit_code", "u/o/m": "unit_code", "uom": "unit_code", "uom.": "unit_code",
+
+            # --- NUEVOS PDF (TDI) ---
+            "part description": "description",
+            "seat model": "seat_model",
+            "aircraft": "aircraft",
+            "manufacturing": "manufacturing",
+            "leadtime": "lead_time",
+            "sales price": "price",
+            "min buy": "min_qty",
+
             # otros posibles
             "unit code": "unit_code", "unit": "unit_code", "lead time": "lead_time",
             "lifecycle": "lifecycle", "cumulative": "cumulative",
@@ -1560,6 +2223,9 @@ async def upload_catalog(
 
         df.rename(columns=normalized_cols, inplace=True)
 
+        # Evitar columnas duplicadas (ej: PUROLATOR trae dos 'Part Number')
+        df = dedupe_columns(df)
+
         # 3.1 Para catálogos tipo STUKERJURGEN:
         if "article_no" in df.columns:
             if "part_number" in df.columns:
@@ -1578,16 +2244,32 @@ async def upload_catalog(
         if "supplier_part_no" in df.columns:
             df["supplier_part_no"] = df["supplier_part_no"].replace("", None).ffill()
 
-        # Columnas de precios por tramo (p.ej. "qty/ea 25-99", ...)
+        # Columnas de precios por tramo:
+        #  - AIRTEC-BRAIDS: "Qty/ea" + rango en fila siguiente (qty_ranges_by_col_lower)
+        #  - PUROLATOR: rangos/números en los encabezados (5-9, 10-24, 500, 1000, ...)
         tier_specs: List[Dict[str, Optional[int]]] = []
+        tier_col_names: set = set()
+
+        # A) Caso qty_ranges_by_col_lower (Qty/ea + fila de rangos)
         for col in df.columns:
             col_lower = str(col).strip().lower()
             if col_lower in qty_ranges_by_col_lower:
                 range_text = qty_ranges_by_col_lower[col_lower]
                 min_q, max_q = parse_qty_range(range_text)
-                tier_specs.append(
-                    {"col": col, "min_qty": min_q, "max_qty": max_q}
-                )
+                tier_specs.append({"col": col, "min_qty": min_q, "max_qty": max_q})
+                tier_col_names.add(str(col))
+
+        # B) Caso encabezados que SON el tramo (5-9 / 10 - 24 / 500 / 1000 ...)
+        for col in df.columns:
+            col_name = col
+            min_q, max_q = parse_tier_header(col_name)
+            if min_q is None:
+                continue
+            # evitamos duplicar si ya viene del caso A)
+            if str(col_name) in tier_col_names:
+                continue
+            tier_specs.append({"col": col_name, "min_qty": min_q, "max_qty": max_q})
+            tier_col_names.add(str(col_name))
 
         # ===============================
         # 4) RECORRER FILAS E INSERTAR EN BD
@@ -1655,6 +2337,12 @@ async def upload_catalog(
                 m_qty = re.search(r"\d+", s_min)
                 if m_qty:
                     min_qty_default = int(m_qty.group(0))
+
+            # Si MOQ viene en comentarios (p.ej. SAFRAN: "MOQ 100 EA")
+            if min_qty_default == 1:
+                moq_from_comments = parse_moq_from_text(row.get("comments"))
+                if moq_from_comments is not None:
+                    min_qty_default = moq_from_comments
 
             # ---------------- PRECIOS ----------------
             # 1) Precio base desde una columna estándar "price"
@@ -1730,6 +2418,11 @@ async def upload_catalog(
                 # si el part_number "visible" no fue el principal, lo agregamos como alias
                 alias_values.append(row.get("part_number"))
                 alias_values.append(row.get("article_no"))
+
+                # columnas duplicadas de part number (PUROLATOR trae varias)
+                for c_name in df.columns:
+                    if str(c_name).startswith("part_number__"):
+                        alias_values.append(row.get(c_name))
 
                 # columnas genéricas que contengan la palabra "alias"/"alternate"
                 for col_name, value in row.items():
@@ -1818,6 +2511,9 @@ async def upload_catalog(
                     if value is None or str(value) == "nan":
                         continue
                     if "qty/ea" in norm_name.lower():
+                        continue
+                    # Evitar guardar columnas de precios por tramo (p.ej. 5-9 / 10-24 / 500...)
+                    if str(col_name) in tier_col_names:
                         continue
                     attr = models.PartAttribute(
                         part_id=part.id,
@@ -1946,6 +2642,14 @@ def search_parts(
                     "currency": pt.currency,
                 }
                 for pt in getattr(part, "price_tiers", [])
+            ],
+            "aliases": [
+                {
+                    "id": al.id,
+                    "code": al.code,
+                    "source": al.source,
+                }
+                for al in db.query(models.PartAlias).filter(models.PartAlias.part_id == part.id).all()
             ],
             "attributes": [
                 {
