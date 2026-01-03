@@ -1511,6 +1511,64 @@ def parse_price_value(price_value) -> Optional[float]:
         return None
 
 
+
+
+# -------------------------------
+# Helpers: notas de precio / vendor parsing
+# -------------------------------
+def detect_pricing_note(value: Any) -> Optional[str]:
+    """
+    Detecta textos de "nota" en celdas donde NO hay un precio numérico.
+    Ejemplos típicos:
+      - "On request"
+      - "Call for information"
+      - "Call for Price and availability"
+      - "Contact us ..."
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return None
+    s = value.strip()
+    if not s or s.lower() in ("nan", "none", "null", "<na>"):
+        return None
+    low = s.lower()
+
+    if "on request" in low:
+        return s
+    if "price and leadtime" in low or "leadtime" in low and "request" in low:
+        return s
+    if "contact us" in low:
+        return s
+    if "call for" in low:
+        return s
+    if "call" in low and ("price" in low or "information" in low or "availabl" in low or "stock" in low):
+        return s
+
+    return None
+
+
+_jehier_trailing_code_re = re.compile(r"^(?P<desc>.+?)\s+(?P<code>[A-Z]{2,}\d{2,}[A-Z0-9]+)\s*$", re.I)
+
+def extract_jehier_trailing_code(text: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    JEHIER: a veces el 'Part Number' viene como descripción + código al final, ej:
+      'UPPER HALF HOT NOZZLE RING EME330104A'
+    Devuelve (code, desc_hint). Si no matchea, (None, None).
+    """
+    if not text:
+        return (None, None)
+    s = re.sub(r"\s+", " ", str(text)).strip()
+    m = _jehier_trailing_code_re.match(s)
+    if not m:
+        return (None, None)
+    code = m.group("code").strip()
+    desc = m.group("desc").strip()
+    # Evitar falsos positivos: si el "desc" es muy corto, no lo usamos
+    if len(desc) < 3:
+        desc = None
+    return (code, desc)
+
 def parse_qty_range(text: str) -> Tuple[Optional[int], Optional[int]]:
     """
     Convierte textos tipo '25-99', '100-249', '500-999', '>1000'
@@ -1569,8 +1627,8 @@ def detect_header_and_qty_ranges(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[s
         "pnr",
         "art.-nr", "art.nr", "bauteil", "bauteil-nr",
     )
-    desc_markers = ("description", "bezeichnung", "desc")
-    other_markers = ("variante", "länge", "lange", "menge", "eur/unit", "vk", "qty/ea", "item")
+    desc_markers = ("description", "bezeichnung", "desc", "designation", "désignation")
+    other_markers = ("variante", "länge", "lange", "menge", "eur/unit", "vk", "qty/ea", "item", "uom", "unit of measure", "sales unit", "currency", "minimum quantity", "minimum order quantity", "moq", "lead time", "leadtime", "unit price", "price per unit", "unit eur", "unit usd", "dealer price", "retail price")
 
     # Buscamos en las primeras filas porque muchos catálogos traen un título arriba
     for i, row in df.head(60).iterrows():
@@ -2242,6 +2300,12 @@ async def upload_catalog(
     # moneda por defecto deducida del nombre del archivo
     default_currency = "EUR" if "eur" in file.filename.lower() else "USD"
 
+    # Flags por proveedor / archivo (para parches específicos sin romper lo existente)
+    _sup_l = (supplier_name or "").lower()
+    _fn_l = (file.filename or "").lower()
+    is_aerox = ("aerox" in _sup_l) or ("aerox" in _fn_l)
+    is_jehier = ("jehier" in _sup_l) or ("jehier" in _fn_l)
+
     if "holmco" in supplier_name.lower() or "holmco" in file.filename.lower():
         supplier = get_or_create_supplier(db, supplier_name)
         catalog = create_catalog(db, supplier, year, file.filename)
@@ -2359,6 +2423,20 @@ async def upload_catalog(
             "pn": "part_number", "p/n": "part_number", "part-no.": "part_number",
             "part-no": "part_number", "part no.": "part_number",
 
+            # Aerox (N23D)
+            "n23d part number": "part_number",
+            "aerox part number": "supplier_part_no",
+            "2026 distributor price (moc)": "price_distributor",
+            "2026 dealer price (non-moc)": "price_dealer",
+            "2026 retail price": "price_retail",
+            "minimum order quantity": "min_qty",
+
+            # JEHIER
+            "part number jehier": "part_number",
+            "conditioning unit": "description",
+            "price per unit": "price",
+            "sales unit": "unit_code",
+
             # Alemán (STUKERJURGEN / STABILUS)
             "bauteil-nr.": "bauteil_nr", "bauteil-nr": "bauteil_nr",
             "bauteil nr.": "bauteil_nr", "bauteil nr": "bauteil_nr",
@@ -2451,6 +2529,27 @@ async def upload_catalog(
             "sales price": "price",
             "min buy": "min_qty",
 
+            # --- NUEVOS EXCEL (ADHETEC / AEROX / JEHIER) ---
+            "customer pn": "part_number",
+            "designation": "description",
+            "unit of measure": "unit_code",
+            "standard lead time": "lead_time",
+            "unit eur prices": "price",
+            "unit eur price": "price",
+
+            # AEROX (N23D) Cylinder Price Book
+            "n23d part number": "part_number",
+            "aerox part number": "supplier_part_no",
+            "minimum order quantity": "min_qty",
+            "2026 distributor price (moc)": "price",
+
+            # JEHIER HNSR_OFFRE
+            "part number jehier": "part_number",
+            "conditioning unit": "description",
+            "sales unit": "unit_code",
+            "price per unit": "price",
+            "minimum quantity": "min_qty",
+
             # otros posibles
             "unit code": "unit_code", "unit": "unit_code", "lead time": "lead_time",
             "lifecycle": "lifecycle", "cumulative": "cumulative",
@@ -2458,12 +2557,26 @@ async def upload_catalog(
 
         normalized_cols: Dict[str, str] = {}
         for col in df.columns:
-            raw_name = str(col).replace("\xa0", " ").strip()
+            raw_name = re.sub(r"\s+", " ", str(col).replace("\xa0", " ").replace("\n", " ").replace("\r", " ")).strip()
             col_key = raw_name.lower()
 
             # 1) Mapeo exacto
             if col_key in column_map:
                 mapped = column_map[col_key]
+
+            # 1.b) Mapeos por prefijo/contiene (evita depender del texto completo del encabezado)
+            elif col_key.startswith("standard lead time"):
+                mapped = "lead_time"
+            elif "lead time" in col_key or "leadtime" in col_key:
+                mapped = "lead_time"
+            elif col_key.startswith("price per unit"):
+                mapped = "price"
+            elif col_key.startswith("minimum quantity") or col_key.startswith("minimum order quantity") or col_key == "moq":
+                mapped = "min_qty"
+            elif col_key.startswith("unit of measure") or col_key == "sales unit":
+                mapped = "unit_code"
+            elif col_key.startswith("designation"):
+                mapped = "description"
 
             # 2) PANASONIC Master Price List: columnas tipo "Master S2 2023", etc.
             elif "master" in col_key and ("s2" in col_key or "$" in col_key):
@@ -2591,14 +2704,36 @@ async def upload_catalog(
             if raw_code is None or str(raw_code).strip() == "":
                 continue
 
-            part_number_full, part_number_root = normalize_part_number(str(raw_code))
+            raw_code_str = str(raw_code).strip()
+            jehier_original_code = None
+            desc_hint_from_code = None
 
-            # Si el "código" no tiene ningún dígito (fila de encabezado), ignorar
-            if not any(ch.isdigit() for ch in part_number_root):
+            # JEHIER: algunos P/N vienen como texto + código al final (ej: "UPPER ... EME330104A")
+            if is_jehier and isinstance(raw_code, str):
+                extracted_code, desc_hint = extract_jehier_trailing_code(raw_code_str)
+                if extracted_code and extracted_code.strip():
+                    jehier_original_code = raw_code_str
+                    raw_code_str = extracted_code.strip()
+                    desc_hint_from_code = desc_hint
+
+            part_number_full, part_number_root = normalize_part_number(raw_code_str)
+
+            # Filas de encabezado / basura típica (evita falsos positivos como "N23D Part Number")
+            code_lower = part_number_full.lower()
+            if (
+                "part number" in code_lower
+                or "p/n" in code_lower
+                or "description" in code_lower
+                or "unit price" in code_lower
+            ):
+                continue
+
+            # Si el "código" no tiene ningún dígito en ninguna parte, probablemente no es PN
+            if not any(ch.isdigit() for ch in part_number_full):
                 continue
 
             # Guardamos el último código visto
-            last_part_code = raw_code
+            last_part_code = raw_code_str
 
             # ---------- DESCRIPCIÓN ----------
             description_val = row.get("description", "")
@@ -2607,6 +2742,10 @@ async def upload_catalog(
                 if description_val is not None and str(description_val) != "nan"
                 else ""
             )
+
+            # Si no hay descripción (o viene como "-") y el P/N traía texto útil (JEHIER), la usamos
+            if (not description or description.strip() in ("-", "—")) and desc_hint_from_code:
+                description = str(desc_hint_from_code).strip()
 
             # ---------- MONEDA ----------
             currency_val = row.get("currency", None)
@@ -2621,36 +2760,76 @@ async def upload_catalog(
 
             # Por defecto 1 unidad
             min_qty_default = 1
+            min_qty_raw_text = None
+            min_qty_is_fractional = False
+
             if min_qty is not None and str(min_qty) != "nan":
                 s_min = str(min_qty).strip()
-                m_qty = re.search(r"\d+", s_min)
-                if m_qty:
-                    min_qty_default = int(m_qty.group(0))
 
-            # Si MOQ viene en comentarios (p.ej. SAFRAN: "MOQ 100 EA")
+                # Intentar parsear número (soporta coma decimal)
+                s_min_norm = s_min.replace(",", ".")
+                m_num = re.search(r"[-+]?\d*\.?\d+", s_min_norm)
+
+                if m_num:
+                    try:
+                        f = float(m_num.group(0))
+                        if f > 0 and float(f).is_integer():
+                            min_qty_default = int(f)
+                            # Si además del número hay texto, preservamos el original
+                            rest = re.sub(r"[-+]?\d*\.?\d+", "", s_min_norm).strip()
+                            if rest and rest not in ("-", "—"):
+                                min_qty_raw_text = s_min
+                        elif f > 0:
+                            # Ej: 8.64 (JEHIER: unidades por m2). Guardamos el valor original en atributos.
+                            min_qty_is_fractional = True
+                            min_qty_raw_text = s_min
+                            min_qty_default = 1
+                    except Exception:
+                        pass
+                else:
+                    # No hay número: preservamos texto (ej: "Call for Information")
+                    if s_min and s_min not in ("-", "—"):
+                        min_qty_raw_text = s_min
+
+                # Fallback: primer entero que aparezca
+                if min_qty_default == 1 and not min_qty_is_fractional and min_qty_raw_text is None:
+                    m_int = re.search(r"\d+", s_min)
+                    if m_int:
+                        min_qty_default = int(m_int.group(0))
+
+# Si MOQ viene en comentarios (p.ej. SAFRAN: "MOQ 100 EA")
             if min_qty_default == 1:
                 moq_from_comments = parse_moq_from_text(row.get("comments"))
                 if moq_from_comments is not None:
                     min_qty_default = moq_from_comments
 
             # ---------------- PRECIOS ----------------
-            # 1) Precio base desde una columna estándar "price"
-            base_price = parse_price_value(row.get("price"))
+            # 1) Precio base (con fallback a múltiples columnas de precio)
+            price_candidate_cols = ["price", "price_distributor", "price_dealer", "price_retail"]
+
+            # incluir duplicados tipo price__2 / price__3 (cuando el encabezado tenía varios precios)
+            for c_name in df.columns:
+                if str(c_name).startswith("price__") and c_name not in price_candidate_cols:
+                    price_candidate_cols.append(c_name)
+
+            base_price: Optional[float] = None
+            pricing_note: Optional[str] = None
+
+            for c in price_candidate_cols:
+                v = row.get(c, None)
+                if v is None or str(v) == "nan":
+                    continue
+
+                p = parse_price_value(v)
+                if p is not None and base_price is None:
+                    base_price = p
+
+                note = detect_pricing_note(v)
+                if note and pricing_note is None:
+                    pricing_note = note
 
             # 2) Precios por tramo desde columnas tipo "qty/ea 25-99", ...
             tier_prices: List[Tuple[Optional[int], Optional[int], float]] = []
-            pricing_note: Optional[str] = None
-
-            # Si el campo price trae texto (ej: "on request"), lo guardamos como nota
-            raw_price_text = row.get("price")
-            if (
-                base_price is None
-                and isinstance(raw_price_text, str)
-                and raw_price_text.strip()
-                and "on request" in raw_price_text.lower()
-            ):
-                pricing_note = raw_price_text.strip()
-
             for spec in tier_specs:
                 col_name = spec["col"]
                 if col_name not in row:
@@ -2663,7 +2842,7 @@ async def upload_catalog(
                 if unit_price is None:
                     # Caso "Price and Leadtime on request."
                     if isinstance(raw_val, str) and raw_val.strip():
-                        pricing_note = pricing_note or raw_val.strip()
+                        pricing_note = pricing_note or detect_pricing_note(raw_val) or raw_val.strip()
                     continue
 
                 min_q = spec["min_qty"] or min_qty_default
@@ -2722,6 +2901,11 @@ async def upload_catalog(
                 # si el part_number "visible" no fue el principal, lo agregamos como alias
                 alias_values.append(row.get("part_number"))
                 alias_values.append(row.get("article_no"))
+
+                # si aplicamos parsing especial (JEHIER), guardamos el texto original como alias
+                if jehier_original_code:
+                    alias_values.append(jehier_original_code)
+
 
                 # columnas duplicadas de part number (PUROLATOR trae varias)
                 for c_name in df.columns:
@@ -2802,6 +2986,15 @@ async def upload_catalog(
 
             # --------- ATRIBUTOS EXTRA ---------
             if is_new_part:
+                # Para catálogos donde la cantidad mínima no es entera (ej: 8.64),
+                # preservamos el valor exacto como atributo.
+                if min_qty_raw_text:
+                    db.add(models.PartAttribute(
+                        part_id=part.id,
+                        attr_name="min_qty_raw",
+                        attr_value=str(min_qty_raw_text),
+                    ))
+
                 standard = {
                     "part_number", "article_no", "description", "price",
                     "currency", "min_qty", "max_qty",
