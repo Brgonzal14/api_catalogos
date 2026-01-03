@@ -145,15 +145,24 @@ def create_catalog(db: Session, supplier: models.Supplier, year: int, filename: 
 
 
 def normalize_part_number(code: str) -> Tuple[str, str]:
-    """Normaliza el código de parte y extrae la raíz."""
+    """Normaliza el código de parte y extrae una 'raíz' para búsquedas por prefijo.
+
+    - Conserva el texto original (con espacios/guiones) como `part_number_full`.
+    - La raíz se obtiene del primer token (antes de espacios) y luego antes de '-' si existe.
+      Ej: "ABS0236 A 2-11" -> "ABS0236" ; "11-19-90024" -> "11".
+    """
     if code is None:
         return "", ""
-    code = code.strip()
-    root = code.split("-")[0]
+    code = str(code).strip()
+    if not code:
+        return "", ""
+
+    first_token = code.split()[0] if code.split() else code
+    root = first_token.split("-")[0] if first_token else ""
     return code, root
 
-import re
 
+# Regex reutilizable para normalización de códigos (A-Z 0-9)
 _norm_re = re.compile(r"[^A-Za-z0-9]+")
 
 def normalize_pn(s: str) -> str:
@@ -756,82 +765,94 @@ def parse_pdf_matzen(pdf_bytes: bytes) -> pd.DataFrame:
         return read_pdf_tables(pdf_bytes)
 
 def parse_pdf_stabilus(pdf_bytes: bytes) -> pd.DataFrame:
-    """STABILUS (Preisliste): filas por tramo (ab Menge / VK)."""
-    try:
-        import pdfplumber
-        items = {}  # pn -> list[(min_qty, price)]
-        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            for page in pdf.pages:
-                tables = page.extract_tables() or []
-                for table in tables:
-                    # detectar header
-                    header_idx = None
-                    for i, row in enumerate(table[:5]):
-                        if not row:
-                            continue
-                        low = " ".join([str(c).lower() for c in row if c is not None])
-                        if "art" in low and "nr" in low and ("vk" in low or "menge" in low):
-                            header_idx = i
-                            break
-                    if header_idx is None:
-                        continue
-                    header = table[header_idx]
-                    # column indexes
-                    col_map = {}
-                    for j, c in enumerate(header):
-                        lc = (str(c).lower() if c is not None else "")
-                        if "art" in lc and "nr" in lc:
-                            col_map["pn"] = j
-                        elif "ab" in lc and "menge" in lc:
-                            col_map["min"] = j
-                        elif "vk" in lc:
-                            col_map["price"] = j
-                    if "pn" not in col_map or "min" not in col_map or "price" not in col_map:
-                        continue
+    """
+    Parser STABILUS (PDF por texto).
+    Estructura típica:
+        Art.-Nr.   ab Menge   VK
+        082384     20         12,045 €
+                   100        7,669 €
+    Donde las filas "hijas" (sin Art.-Nr.) heredan el último Art.-Nr.
+    """
+    lines: List[str] = []
+    for page_text in _iter_text_pages_pypdf(pdf_bytes):
+        for ln in (page_text or "").splitlines():
+            s = ln.replace("\xa0", " ").strip()
+            if s:
+                lines.append(s)
 
-                    for row in table[header_idx+1:]:
-                        if not row or len(row) <= max(col_map.values()):
-                            continue
-                        pn = row[col_map["pn"]]
-                        min_q = row[col_map["min"]]
-                        pr = row[col_map["price"]]
-                        if pn is None:
-                            continue
-                        pn = str(pn).strip()
-                        if not pn or pn.lower().startswith("art"):
-                            continue
-                        # limpiar min qty
-                        min_qty = None
-                        if min_q is not None:
-                            m = re.search(r"\d+", str(min_q))
-                            if m:
-                                min_qty = int(m.group(0))
-                        price = parse_price_value(pr)
-                        if min_qty is None and price is None:
-                            continue
-                        items.setdefault(pn, [])
-                        if min_qty is None:
-                            min_qty = 1
-                        if price is not None:
-                            items[pn].append((min_qty, price))
-
-        rows = []
-        for pn, tiers in items.items():
-            tiers = sorted({(mq, pr) for mq, pr in tiers}, key=lambda x: x[0])
-            for idx, (mq, pr) in enumerate(tiers):
-                next_mq = tiers[idx+1][0] if idx+1 < len(tiers) else None
-                max_qty = (next_mq - 1) if next_mq is not None else None
-                rows.append({
-                    "part_number": pn,
-                    "min_qty": mq,
-                    "max_qty": max_qty,
-                    "price": pr,
-                    "currency": "EUR",
-                })
-        return pd.DataFrame(rows)
-
-    except Exception:
+    if not lines:
         return pd.DataFrame()
+
+    current_pn: Optional[str] = None
+    tiers: Dict[str, List[Tuple[int, float]]] = {}
+
+    # patrones
+    re_full = re.compile(
+        r"^(?P<pn>[A-Z0-9\-]{4,})\s+(?P<qty>\d+(?:[\.,]\d+)?)\s+(?P<price>\d+(?:\.\d{3})*(?:,\d+)?)(?:\s*€)?$",
+        re.IGNORECASE,
+    )
+    re_tier = re.compile(
+        r"^(?P<qty>\d+(?:[\.,]\d+)?)\s+(?P<price>\d+(?:\.\d{3})*(?:,\d+)?)(?:\s*€)?$"
+    )
+
+    def _to_int_qty(s: str) -> Optional[int]:
+        if not s:
+            return None
+        ss = str(s).strip()
+        # STABILUS usa enteros, pero por si viene "100,0"
+        ss = ss.replace(".", "").replace(",", ".")
+        try:
+            return int(float(ss))
+        except Exception:
+            m = re.search(r"\d+", ss)
+            return int(m.group(0)) if m else None
+
+    for ln in lines:
+        low = ln.lower()
+        if any(k in low for k in ("hansair", "sonderpreisliste", "gültig", "gueltig", "seite", "art.-nr", "ab menge", "vk")):
+            continue
+
+        ln2 = ln.replace("€", "").strip()
+
+        m = re_full.match(ln2)
+        if m:
+            pn = m.group("pn").strip()
+            qty = _to_int_qty(m.group("qty"))
+            price = parse_price_value(m.group("price"))
+            if qty is not None and price is not None:
+                tiers.setdefault(pn, []).append((qty, price))
+                current_pn = pn
+            continue
+
+        m2 = re_tier.match(ln2)
+        if m2 and current_pn:
+            qty = _to_int_qty(m2.group("qty"))
+            price = parse_price_value(m2.group("price"))
+            if qty is not None and price is not None:
+                tiers.setdefault(current_pn, []).append((qty, price))
+            continue
+
+    if not tiers:
+        return pd.DataFrame()
+
+    # construir filas con max_qty (siguiente qty - 1)
+    rows: List[Dict[str, Any]] = []
+    for pn, arr in tiers.items():
+        arr_sorted = sorted({q: p for q, p in arr}.items(), key=lambda t: t[0])  # dedupe por qty
+        for i, (min_q, price) in enumerate(arr_sorted):
+            next_min = arr_sorted[i + 1][0] if i + 1 < len(arr_sorted) else None
+            max_q = (next_min - 1) if next_min is not None else None
+            rows.append(
+                {
+                    "part_number": pn,
+                    "min_qty": int(min_q),
+                    "max_qty": int(max_q) if max_q is not None else None,
+                    "price": float(price),
+                    "currency": "EUR",
+                }
+            )
+
+    return pd.DataFrame(rows)
 
 def _parse_qty_token(token: str) -> Tuple[Optional[int], Optional[str]]:
     """Token tipo '100St.' / '100,0' -> (100, 'St.')"""
@@ -854,95 +875,157 @@ def _parse_qty_token(token: str) -> Tuple[Optional[int], Optional[str]]:
         return (None, u)
 
 def parse_pdf_stuker_sac(pdf_bytes: bytes) -> pd.DataFrame:
-    """STUKERJURGEN SAC Products: parseo por texto (alemán)"""
-    rows = []
-    try:
-        for page_text in _iter_text_pages_pypdf(pdf_bytes):
-            if not page_text:
+    """
+    Parser STUKERJURGEN SAC Products (PDF por texto).
+
+    PDF suele venir como:
+      P/N  Bauteil-Nr. Variante  Bezeichnung  Länge(mm)  Menge  Unit  EUR/Unit
+      20014 ABS0236    A 2-11    Einhängeprofil 4500     100,0 m36,10
+
+    Requerimiento clave: guardar el código completo "ABS0236 A 2-11" (Bauteil-Nr. + Variante).
+    Guardamos el P/N numérico como article_no.
+    """
+    rows: List[Dict[str, Any]] = []
+    for page_text in _iter_text_pages_pypdf(pdf_bytes):
+        for raw in (page_text or "").splitlines():
+            line = raw.replace("\xa0", " ").strip()
+            if not line:
                 continue
-            for line in page_text.splitlines():
-                raw = (line or "").strip()
-                if not raw:
+
+            low = line.lower()
+
+            # saltar encabezados / notas
+            if low.startswith("p/n") or "bauteil-nr" in low or "bezeichnung" in low or "pricelist" in low:
+                continue
+            if "sales conditions" in low or low.startswith("- ") or low.startswith("-"):
+                continue
+
+            # debe empezar con un P/N numérico
+            if not re.match(r"^\d{4,}\s+\S+", line):
+                continue
+
+            # normalizar "m on request" => on request
+            line_norm = re.sub(r"\bmon\s+request\b", "on request", line, flags=re.IGNORECASE)
+
+            # Caso "on request"
+            if "on request" in line_norm.lower():
+                # quitamos la cola "on request"
+                base = re.sub(r"\bon\s+request\b", "", line_norm, flags=re.IGNORECASE).strip()
+                toks = base.split()
+                if len(toks) < 3:
                     continue
-                low = raw.lower()
-                if low.startswith("p/n") or "bauteil-nr" in low or "variante" in low or "bezeichnung" in low:
-                    continue
-                if not re.match(r"^\d{4,}\s+", raw):
-                    continue
+                article_no = toks[0]
+                bauteil = toks[1]
 
-                # normaliza typos comunes
-                raw = re.sub(r"\bmon\s+request\b", "on request", raw, flags=re.IGNORECASE)
+                # intentar extraer variante + descripción + (length) + (min_qty) + (uom)
+                tail = toks[2:]
+                # buscar el último token numérico (largo)
+                length_mm = None
+                for j in range(len(tail) - 1, -1, -1):
+                    if re.fullmatch(r"\d+(?:[\.,]\d+)?", tail[j]):
+                        length_mm = tail[j]
+                        tail = tail[:j]  # antes del length queda variante+desc
+                        break
 
-                # extraer precio al final (con posible unidad pegada: 'm36,10', o qty+unit+price: '100St.22,75')
-                m = re.search(r"(?P<pre>[A-Za-z\.]*)(?P<price>\d+(?:\.\d{3})*(?:,\d+)?)\s*$", raw)
-                if not m:
-                    # on request
-                    if "on request" in low:
-                        # intentamos igualmente sacar los campos básicos
-                        tokens = raw.split()
-                        if len(tokens) < 6:
-                            continue
-                        pn = tokens[0]
-                        supplier = tokens[1]
-                        variant = tokens[2]
-                        # asume length y qty al final
-                        length = tokens[-2]
-                        qty_token = tokens[-1]
-                        qty_i, qty_u = _parse_qty_token(qty_token)
-                        desc = " ".join(tokens[3:-2]).strip()
-                        rows.append({
-                            "part_number": pn,
-                            "supplier_part_no": supplier,
-                            "variant": variant,
-                            "description": desc,
-                            "length_mm": length,
-                            "min_qty": qty_i,
-                            "uom": qty_u,
-                            "pricing_note": "on request",
-                            "currency": "EUR",
-                        })
-                    continue
+                # separar variante/desc por heurística
+                var_toks: List[str] = []
+                desc_toks: List[str] = []
+                var_re = re.compile(r"^[A-Z0-9][A-Z0-9\-]*$")
 
-                pre = (m.group("pre") or "").strip()
-                price_raw = (m.group("price") or "").strip()
-                line_wo_price = raw[:m.start()].rstrip()
+                k = 0
+                while k < len(tail):
+                    tok = tail[k]
+                    if var_re.match(tok) and not re.search(r"[a-zäöüß]", tok):
+                        var_toks.append(tok)
+                        k += 1
+                    else:
+                        break
+                desc_toks = tail[k:]
 
-                unit_from_price = pre if pre else None
+                variante = " ".join(var_toks).strip() or None
+                part_number = " ".join([bauteil] + var_toks).strip() if var_toks else bauteil
+                description = " ".join(desc_toks).strip() if desc_toks else ""
 
-                tokens = line_wo_price.split()
-                if len(tokens) < 6:
-                    continue
+                rows.append(
+                    {
+                        "article_no": article_no,
+                        "bauteil_nr": bauteil,
+                        "variante": variante,
+                        "part_number": part_number,
+                        "description": description,
+                        "length_mm": length_mm,
+                        "min_qty": None,
+                        "unit_code": None,
+                        "price": None,
+                        "currency": "EUR",
+                        "pricing_note": "on request",
+                    }
+                )
+                continue
 
-                pn = tokens[0]
-                supplier = tokens[1]
-                variant = tokens[2]
+            # Caso con precio al final: captura unidad pegada al precio (m36,10 / St.22,75 / ...)
+            m_price = re.search(r"(?P<pre>[A-Za-z\.]+)?(?P<price>\d+(?:\.\d{3})*(?:,\d+))\s*$", line_norm)
+            if not m_price:
+                continue
 
-                qty_token = tokens[-1]
-                length = tokens[-2]
+            unit_from_price = (m_price.group("pre") or "").strip() or None
+            price = parse_price_value(m_price.group("price"))
 
-                qty_i, qty_u = _parse_qty_token(qty_token)
-                uom = unit_from_price or qty_u
+            left = line_norm[: m_price.start()].strip()
+            toks = left.split()
+            if len(toks) < 5:
+                continue
 
-                desc = " ".join(tokens[3:-2]).strip()
+            article_no = toks[0]
+            bauteil = toks[1]
 
-                price = parse_price_value(price_raw)
-                if price is None:
-                    continue
+            # los últimos tokens suelen ser: <length_mm> <qty>
+            length_token = toks[-2]
+            qty_token = toks[-1]
+            length_mm = length_token if re.fullmatch(r"\d+(?:[\.,]\d+)?", length_token) else None
 
-                rows.append({
-                    "part_number": pn,
-                    "supplier_part_no": supplier,
-                    "variant": variant,
-                    "description": desc,
-                    "length_mm": length,
-                    "min_qty": qty_i,
-                    "uom": uom,
+            qty_val, qty_uom = _parse_qty_token(qty_token)
+
+            mid = toks[2:-2]  # variante + descripción
+
+            var_re = re.compile(r"^[A-Z0-9][A-Z0-9\-]*$")
+            var_toks: List[str] = []
+            desc_toks: List[str] = []
+            k = 0
+            while k < len(mid):
+                tok = mid[k]
+                if var_re.match(tok) and not re.search(r"[a-zäöüß]", tok):
+                    var_toks.append(tok)
+                    k += 1
+                else:
+                    break
+            desc_toks = mid[k:]
+
+            variante = " ".join(var_toks).strip() or None
+            part_number = " ".join([bauteil] + var_toks).strip() if var_toks else bauteil
+            description = " ".join(desc_toks).strip() if desc_toks else ""
+
+            uom = unit_from_price or qty_uom
+
+            rows.append(
+                {
+                    "article_no": article_no,
+                    "bauteil_nr": bauteil,
+                    "variante": variante,
+                    "part_number": part_number,
+                    "description": description,
+                    "length_mm": length_mm,
+                    "min_qty": qty_val,
+                    "unit_code": uom,
                     "price": price,
                     "currency": "EUR",
-                })
-        return pd.DataFrame(rows)
-    except Exception:
-        return pd.DataFrame(rows)
+                }
+            )
+
+    if not rows:
+        return pd.DataFrame()
+
+    return pd.DataFrame(rows)
 
 def parse_pdf_vincorion(pdf_bytes: bytes) -> pd.DataFrame:
     """VINCORION Airbus spares: parseo por texto (ATA | Partnumber | Designation | Lead Time | Price US-$)."""
@@ -1102,6 +1185,81 @@ def dedupe_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 _tier_range_re = re.compile(r"^\s*(\d+)\s*-\s*(\d+)\s*$")
 _tier_num_re = re.compile(r"^\s*(\d+)\s*$")
+
+def clean_multiline_cell(value: Any) -> Any:
+    """Limpia celdas que vienen con saltos de línea (común al convertir PDF->Excel)."""
+    try:
+        if value is None or (isinstance(value, float) and pd.isna(value)):
+            return value
+    except Exception:
+        pass
+
+    if isinstance(value, str):
+        s = value.replace("\xa0", " ").strip()
+        if "\n" in s:
+            parts = [p.strip() for p in s.splitlines() if p.strip()]
+            uniq: List[str] = []
+            for p in parts:
+                if p not in uniq:
+                    uniq.append(p)
+            s = " ".join(uniq)
+        return s
+
+    return value
+
+def expand_multivalue_qty_price_rows(
+    df: pd.DataFrame,
+    qty_col: str = "min_qty",
+    price_col: str = "price",
+    uom_col: Optional[str] = "unit_code",
+) -> pd.DataFrame:
+    """Expande filas donde qty/price vienen apilados en una misma celda (e.g. "20\n100" / "12,045\n7,669").
+    Devuelve un DF nuevo (o el mismo si no hay nada que expandir).
+    """
+    if qty_col not in df.columns or price_col not in df.columns:
+        return df
+
+    qty_re = re.compile(r"\d+(?:[\.,]\d+)?")
+    price_re = re.compile(r"\d+(?:\.\d{3})*(?:,\d+)?")
+
+    new_rows: List[Dict[str, Any]] = []
+    changed = False
+
+    for _, row in df.iterrows():
+        q_raw = row.get(qty_col)
+        p_raw = row.get(price_col)
+
+        q_list = qty_re.findall(str(q_raw)) if q_raw is not None and not (isinstance(q_raw, float) and pd.isna(q_raw)) else []
+        p_list = price_re.findall(str(p_raw)) if p_raw is not None and not (isinstance(p_raw, float) and pd.isna(p_raw)) else []
+
+        # si no hay multi-valores, dejamos tal cual
+        if len(q_list) <= 1 or len(p_list) <= 1:
+            new_rows.append(row.to_dict())
+            continue
+
+        # expandimos solo si calzan cantidades/precios
+        n = min(len(q_list), len(p_list))
+        if n <= 1:
+            new_rows.append(row.to_dict())
+            continue
+
+        changed = True
+
+        u_list: List[str] = []
+        if uom_col and uom_col in df.columns:
+            u_raw = row.get(uom_col)
+            if isinstance(u_raw, str):
+                u_list = [u for u in re.split(r"\s+", u_raw.replace("\n", " ").strip()) if u]
+
+        for i in range(n):
+            d = row.to_dict()
+            d[qty_col] = q_list[i]
+            d[price_col] = p_list[i]
+            if uom_col and uom_col in df.columns and u_list and len(u_list) == n:
+                d[uom_col] = u_list[i]
+            new_rows.append(d)
+
+    return pd.DataFrame(new_rows) if changed else df
 
 def parse_tier_header(header: Any) -> Tuple[Optional[int], Optional[int]]:
     """Interpreta encabezados tipo '5-9', '10 - 24' o '500' como tramos de precios."""
@@ -1350,14 +1508,42 @@ def detect_header_and_qty_ranges(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[s
     """
     Detecta la fila de encabezados y rangos de cantidad.
     Ajusta el DataFrame para que solo contenga datos y actualiza las columnas.
+
+    Soporta:
+      - Encabezados típicos en inglés (Part Number / Description / Item)
+      - Encabezados en alemán (P/N, Bauteil-Nr., Bezeichnung, Variante, Länge, Menge, VK, EUR/Unit)
     """
     header_row_idx = None
-    for i, row in df.head(40).iterrows():
-        lower_vals = [str(v).strip().lower() for v in row.values if isinstance(v, str)]
-        has_part_header = any("part" in v and "number" in v for v in lower_vals)
-        has_description = "description" in lower_vals
-        has_item = any(v.startswith("item") for v in lower_vals)
-        if has_part_header or has_description or has_item:
+
+    def _has_any(vals: List[str], needles: Tuple[str, ...]) -> bool:
+        for v in vals:
+            for n in needles:
+                if n in v:
+                    return True
+        return False
+
+    part_markers = (
+        "part number", "part no", "part-no", "part_number", "p/n", "pn",
+        "art.-nr", "art.nr", "bauteil", "bauteil-nr",
+    )
+    desc_markers = ("description", "bezeichnung", "desc")
+    other_markers = ("variante", "länge", "lange", "menge", "eur/unit", "vk", "qty/ea", "item")
+
+    # Buscamos en las primeras filas porque muchos catálogos traen un título arriba
+    for i, row in df.head(60).iterrows():
+        lower_vals = []
+        for v in row.values:
+            if isinstance(v, str):
+                s = v.replace("\xa0", " ").strip().lower()
+                if s:
+                    lower_vals.append(s)
+
+        has_part = _has_any(lower_vals, part_markers)
+        has_desc = _has_any(lower_vals, desc_markers)
+        hits_other = sum(1 for v in lower_vals if _has_any([v], other_markers))
+
+        # Heurística: part + (desc o 2+ marcadores extra) => header
+        if has_part and (has_desc or hits_other >= 2):
             header_row_idx = i
             break
 
@@ -1377,7 +1563,7 @@ def detect_header_and_qty_ranges(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[s
                 else:
                     raw_name = str(val).strip()
             else:
-                raw_name = str(val).strip() if val is not None else ""
+                raw_name = str(val).replace("\xa0", " ").strip() if val is not None else ""
             if not raw_name:
                 raw_name = f"col_{idx}"
 
@@ -2130,6 +2316,17 @@ async def upload_catalog(
             "pn": "part_number", "p/n": "part_number", "part-no.": "part_number",
             "part-no": "part_number", "part no.": "part_number",
 
+            # Alemán (STUKERJURGEN / STABILUS)
+            "bauteil-nr.": "bauteil_nr", "bauteil-nr": "bauteil_nr",
+            "bauteil nr.": "bauteil_nr", "bauteil nr": "bauteil_nr",
+            "variante": "variante",
+            "bezeichnung": "description",
+            "länge (mm)": "length_mm", "länge(mm)": "length_mm", "länge": "length_mm",
+            "menge": "min_qty", "ab menge": "min_qty",
+            "eur/unit": "price", "eur / unit": "price", "eur pro unit": "price",
+            "vk": "price",
+            "art.-nr.": "part_number", "art.-nr": "part_number", "art.nr.": "part_number", "art.nr": "part_number",
+
             # Article / ArticleNo
             "articleno.": "article_no", "article no.": "article_no", "article no": "article_no",
 
@@ -2199,7 +2396,7 @@ async def upload_catalog(
 
         normalized_cols: Dict[str, str] = {}
         for col in df.columns:
-            raw_name = str(col).strip()
+            raw_name = str(col).replace("\xa0", " ").strip()
             col_key = raw_name.lower()
 
             # 1) Mapeo exacto
@@ -2226,11 +2423,41 @@ async def upload_catalog(
         # Evitar columnas duplicadas (ej: PUROLATOR trae dos 'Part Number')
         df = dedupe_columns(df)
 
-        # 3.1 Para catálogos tipo STUKERJURGEN:
-        if "article_no" in df.columns:
-            if "part_number" in df.columns:
+        # Limpieza: algunas conversiones Excel/PDF dejan saltos de línea dentro de una misma celda
+        if any(c in df.columns for c in ("bauteil_nr", "variante", "description", "part_number", "article_no")):
+            df = df.applymap(clean_multiline_cell)
+
+        # 3.1 Heurísticas STUKERJURGEN / catálogos alemanes:
+        # - En STUKERJURGEN SAC: "P/N" suele ser un número interno (article_no)
+        #   y el código buscable real viene como "Bauteil-Nr." (+ "Variante").
+        if "bauteil_nr" in df.columns:
+            # Si venía como part_number (P/N), lo guardamos como article_no
+            if "part_number" in df.columns and "article_no" not in df.columns:
+                df["article_no"] = df["part_number"]
+            elif "part_number" in df.columns and "article_no" in df.columns:
+                df["article_no"] = df["article_no"].where(df["article_no"].notna(), df["part_number"])
+
+            # Construimos el part_number completo (con espacios/guiones) desde Bauteil-Nr. + Variante
+            base = df["bauteil_nr"].fillna("").astype(str).str.strip()
+            if "variante" in df.columns:
+                var = df["variante"].fillna("").astype(str).str.strip()
+                df["part_number"] = (base + " " + var).str.strip()
+            else:
+                df["part_number"] = base
+
+            df.loc[df["part_number"] == "", "part_number"] = None
+
+        # Caso "antiguo": si article_no parece más un código (con letras) y part_number es solo numérico
+        elif "article_no" in df.columns and "part_number" in df.columns:
+            sample_article = " ".join(df["article_no"].dropna().astype(str).head(30).tolist())
+            sample_pn = " ".join(df["part_number"].dropna().astype(str).head(30).tolist())
+            if re.search(r"[A-Za-z]", sample_article) and not re.search(r"[A-Za-z]", sample_pn):
                 df["supplier_part_no"] = df["part_number"]
-            df["part_number"] = df["article_no"]
+                df["part_number"] = df["article_no"]
+
+        # Expansión: algunos catálogos apilan varias cantidades/precios dentro de una misma celda
+        # (por ejemplo "20\n100" y "12,045\n7,669"). Esto los separa en filas distintas.
+        df = expand_multivalue_qty_price_rows(df, qty_col="min_qty", price_col="price", uom_col="unit_code")
 
         # Rellenar hacia abajo códigos que vienen en blanco en filas hijas
         if "part_number" in df.columns:
