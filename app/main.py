@@ -640,6 +640,18 @@ def _looks_like_vincorion(text: str) -> bool:
     t = (text or "").lower()
     return ("vincorion" in t) or ("annual price catalogue" in t and "spare parts" in t)
 
+def _looks_like_albany(text: str) -> bool:
+    t = (text or "").lower()
+    # "Spares and Repair Catalog 2026" + "Albany"
+    return ("albany" in t) and ("spares" in t and "catalog" in t)
+
+def _looks_like_holcim(text: str) -> bool:
+    t = (text or "").lower()
+    # Holcim Pricing table (Floorsil / Airfloor)
+    return ("holcim" in t) and ("pricing table" in t or "floorsil" in t or "airfloor" in t)
+
+
+
 def parse_pdf_aes(pdf_bytes: bytes) -> pd.DataFrame:
     """AES Distributor price list (PDF con tablas)."""
     try:
@@ -1123,6 +1135,290 @@ def parse_pdf_vincorion(pdf_bytes: bytes) -> pd.DataFrame:
 
 
 
+
+
+# ============================================================
+#  NUEVOS PDF (ALBANY / HOLCIM)
+# ============================================================
+
+_albany_token = r"(?:-|[A-Z0-9][A-Z0-9\-/\.]*\d[A-Z0-9\-/\.]*)"
+_albany_row_re = re.compile(
+    rf"^\s*(?P<boeing>{_albany_token})\s+(?P<current>{_albany_token})\s+(?P<previous>{_albany_token})\s+"
+    r"(?P<desc>.+?)\s+(?P<qty>\d+(?:\.\d+)?)\s+(?P<uom>[A-Za-z\.]+)\s+\$(?P<price>[\d,]+\.\d{2})\s*$"
+)
+_albany_price_pat = re.compile(r"\$\s*[\d,]+\.\d{2}\b")
+
+def _albany_clean_line(s: str) -> str:
+    s = (s or "").replace("\xa0", " ").strip()
+    # arreglos típicos de extracción: ")1" -> ") 1" y "-AIR" -> "- AIR"
+    s = re.sub(r"\)(?=\d)", ") ", s)
+    s = re.sub(r"(?<=\s)-(?=[A-Za-z])", "- ", s)
+    s = re.sub(r"\s{2,}", " ", s)
+    return s
+
+def parse_pdf_albany(pdf_bytes: bytes) -> pd.DataFrame:
+    """
+    ALBANY 2026 BOEING SPARES CATALOG (PDF):
+    Extrae listado de repuestos desde texto (pypdf).
+    Columnas típicas:
+      BOEING/INDUSTRY PN | CURRENT ALBANY PN | PREVIOUS ALBANY PN | DESCRIPTION | QTY | UOM | PRICE (USD)
+
+    Además:
+      - si hay filas partidas (descripción en una línea y qty/price en la siguiente), las une.
+    """
+    rows: List[Dict[str, Any]] = []
+
+    for page_text in _iter_text_pages_pypdf(pdf_bytes):
+        if not page_text or "$" not in page_text:
+            continue
+
+        raw_lines = [ln for ln in page_text.splitlines() if ln and ln.strip()]
+        i = 0
+        while i < len(raw_lines):
+            ln = _albany_clean_line(raw_lines[i])
+
+            # saltar fees / líneas no-PN
+            low = ln.lower()
+            if low.startswith("minimum value of $") or " fee $" in low or low.endswith(" usd."):
+                i += 1
+                continue
+
+            # match directo (fila completa)
+            if _albany_price_pat.search(ln):
+                m = _albany_row_re.match(ln)
+                if m:
+                    gd = m.groupdict()
+                    rows.append(
+                        {
+                            "part_number": gd["current"].strip(),
+                            "description": gd["desc"].strip(),
+                            "price": gd["price"].strip(),
+                            "currency": "USD",
+                            "min_qty": gd["qty"].strip(),
+                            "unit_code": gd["uom"].strip(),
+                            "alias_boeing": (gd["boeing"].strip() if gd["boeing"].strip() != "-" else None),
+                            "alias_previous": (gd["previous"].strip() if gd["previous"].strip() != "-" else None),
+                        }
+                    )
+                i += 1
+                continue
+
+            # intentar unir con la siguiente línea si trae qty/price
+            if i + 1 < len(raw_lines):
+                nxt = _albany_clean_line(raw_lines[i + 1])
+                combined = (ln + " " + nxt).strip()
+                if _albany_price_pat.search(combined):
+                    m = _albany_row_re.match(combined)
+                    if m:
+                        gd = m.groupdict()
+                        rows.append(
+                            {
+                                "part_number": gd["current"].strip(),
+                                "description": gd["desc"].strip(),
+                                "price": gd["price"].strip(),
+                                "currency": "USD",
+                                "min_qty": gd["qty"].strip(),
+                                "unit_code": gd["uom"].strip(),
+                                "alias_boeing": (gd["boeing"].strip() if gd["boeing"].strip() != "-" else None),
+                                "alias_previous": (gd["previous"].strip() if gd["previous"].strip() != "-" else None),
+                            }
+                        )
+                        i += 2
+                        continue
+
+            i += 1
+
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+
+    # limpiar tipos
+    df["price"] = df["price"].apply(parse_price_value)
+    df["min_qty"] = df["min_qty"].apply(lambda x: int(float(x)) if x is not None and str(x) != "nan" and str(x) != "" else None)
+
+    # eliminar duplicados exactos para evitar PriceTiers repetidos
+    df = df.drop_duplicates(subset=["part_number", "price", "min_qty", "alias_boeing", "alias_previous", "description"])
+
+    return df
+
+
+_holcim_price_re = re.compile(r"€\s*(\d[\d\.]*,\d{2}|\d[\d,]*\.\d{2})")
+
+def _parse_holcim_qty_range(qty_raw: str, moq_raw: str) -> Tuple[Optional[int], Optional[int], str]:
+    """Devuelve (min_qty, max_qty, qty_tag)."""
+    q = (qty_raw or "").strip()
+    ql = q.lower()
+    moq = (moq_raw or "").strip()
+
+    def moq_int() -> Optional[int]:
+        m = re.search(r"\d+", moq.replace(".", ""))
+        return int(m.group(0)) if m else None
+
+    # All / ea -> usamos MOQ como mínimo
+    if ql in ("all", "ea", "each"):
+        return moq_int() or 1, None, q
+
+    m = re.search(r"^(\d+)\s*to\s*(\d+)$", ql)
+    if m:
+        return int(m.group(1)), int(m.group(2)), q
+
+    m = re.search(r"^(\d+)\s*-\s*(\d+)$", ql)
+    if m:
+        return int(m.group(1)), int(m.group(2)), q
+
+    m = re.search(r"^(\d+)\s*(?:and\s+up|\+)$", ql)
+    if m:
+        return int(m.group(1)), None, q
+
+    m = re.search(r"^>\s*(\d+)$", ql)
+    if m:
+        return int(m.group(1)), None, q
+
+    m = re.search(r"^(\d+)$", ql)
+    if m:
+        return int(m.group(1)), None, q
+
+    # fallback: MOQ
+    return moq_int() or None, None, q
+
+def parse_pdf_holcim(pdf_bytes: bytes) -> pd.DataFrame:
+    """
+    HOLCIM Pricing 2026 (PDF de 1 página):
+    Extrae productos y price-tiers desde texto (pdfplumber).
+    - Maneja rangos "36 to 60", "60-108", "940 and up", "> 81", y "All/ea".
+    - Conserva MOQ y un resumen de tiers como atributo (comments) en la primera fila del producto.
+    """
+    text = _first_page_text_pdfplumber(pdf_bytes) or _first_page_text_pypdf(pdf_bytes) or ""
+    lines = [ln.strip() for ln in text.splitlines() if ln and ln.strip()]
+
+    # modo de unidad según encabezado
+    unit_mode = None  # "Each" o "sqm"
+
+    # producto actual + acumuladores
+    current_product: Optional[str] = None
+    product_info: Dict[str, Dict[str, Any]] = {}  # product -> {tiers:[], notes:set(), unit_mode:str}
+    product_order: List[str] = []
+
+    row_re = re.compile(
+        r"^(?P<left>.+?)\s+(?P<qty>(?:All|ea|EA|each|EACH|>\s*\d+|\d+\s*to\s*\d+|\d+\s*-\s*\d+|\d+\s*and\s*up|\d+\s*\+|\d+))\s+€\s*(?P<price>\d[\d\.]*,\d{2}|\d[\d,]*\.\d{2})\s+(?P<moq>.+)$"
+    )
+
+    def is_noise_line(s: str) -> bool:
+        sl = s.lower()
+        if sl.startswith("hansair") or sl.startswith("pricing table") or sl.startswith("effective for"):
+            return True
+        if sl.startswith("floorsil products") or sl.startswith("proprietary information"):
+            return True
+        if sl.startswith("this document contains") or sl.startswith("this information shall"):
+            return True
+        if sl.startswith("name:") or sl.startswith("title:") or sl.startswith("date:"):
+            return True
+        if sl.startswith("qty € price"):
+            return True
+        return False
+
+    for ln in lines:
+        # detect unit mode BEFORE skipping headers/noise
+        if "price / each" in ln.lower():
+            unit_mode = "Each"
+            continue
+        if "price per sqm" in ln.lower():
+            unit_mode = "sqm"
+            continue
+
+        if is_noise_line(ln):
+            continue
+
+        m = row_re.match(ln)
+        if not m:
+            continue
+
+        left = m.group("left").strip()
+        qty_raw = m.group("qty").strip()
+        price_raw = m.group("price").strip()
+        moq_raw = m.group("moq").strip()
+
+        # algunas líneas son "packaging" y pertenecen al producto anterior
+        left_l = left.lower()
+        is_packaging = (
+            current_product is not None
+            and (
+                left_l.startswith("310ml")
+                or left_l.startswith("490ml")
+                or left_l.endswith("per tube")
+                or "tubes per carton" in left_l
+                or left_l.endswith("per carton")
+            )
+        )
+
+        if (not is_packaging) or current_product is None:
+            current_product = left
+            if current_product not in product_info:
+                product_info[current_product] = {"tiers": [], "notes": set(), "unit_mode": unit_mode}
+                product_order.append(current_product)
+        else:
+            # guardamos nota de packaging
+            product_info[current_product]["notes"].add(left)
+
+        # tier
+        min_q, max_q, qty_tag = _parse_holcim_qty_range(qty_raw, moq_raw)
+        product_info[current_product]["tiers"].append(
+            {
+                "min_qty": min_q,
+                "max_qty": max_q,
+                "price": price_raw,
+                "moq": moq_raw,
+                "qty_tag": qty_tag,
+                "unit_mode": unit_mode,
+                "packaging_note": (left if is_packaging else None),
+            }
+        )
+
+    # construir filas
+    out_rows: List[Dict[str, Any]] = []
+    for product in product_order:
+        info = product_info[product]
+        tiers = info["tiers"]
+
+        # resumen legible (guardado como atributo en la primera fila)
+        summary_lines = []
+        if info["notes"]:
+            summary_lines.append("Packaging: " + " | ".join(sorted(info["notes"])))
+        for t in tiers:
+            rng = t["qty_tag"]
+            summary_lines.append(f"{rng} -> € {t['price']} (MOQ: {t['moq']})")
+        comments_summary = "\n".join(summary_lines).strip() if summary_lines else None
+
+        for j, t in enumerate(tiers):
+            out_rows.append(
+                {
+                    "part_number": product,
+                    "description": product if j == 0 else None,
+                    "price": t["price"],
+                    "currency": "EUR",
+                    "min_qty": t["min_qty"],
+                    "max_qty": t["max_qty"],
+                    "unit_code": t["unit_mode"] or info.get("unit_mode") or None,
+                    "moq": t["moq"],
+                    "qty_range": t["qty_tag"],
+                    "comments": comments_summary if j == 0 else None,
+                }
+            )
+
+    if not out_rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(out_rows)
+
+    # limpiar precio
+    df["price"] = df["price"].apply(parse_price_value)
+
+    # eliminar duplicados exactos
+    df = df.drop_duplicates(subset=["part_number", "min_qty", "max_qty", "price", "currency", "unit_code", "moq", "qty_range"])
+
+    return df
+
 def read_pdf_vendor_dfs(pdf_bytes: bytes) -> List[pd.DataFrame]:
     """
     Decide el parser PDF según el contenido del PDF.
@@ -1178,6 +1474,19 @@ def read_pdf_vendor_dfs(pdf_bytes: bytes) -> List[pd.DataFrame]:
             df = parse_pdf_vincorion(pdf_bytes)
             if df is not None and not df.empty:
                 return [df]
+
+        # ALBANY (Boeing spares) - PDF por texto
+        if _looks_like_albany(first):
+            df = parse_pdf_albany(pdf_bytes)
+            if df is not None and not df.empty:
+                return [df]
+
+        # HOLCIM Pricing - PDF por texto (pdfplumber)
+        if _looks_like_holcim(first):
+            df = parse_pdf_holcim(pdf_bytes)
+            if df is not None and not df.empty:
+                return [df]
+
 
     except Exception as e:
         # Si el parser específico falla, intentamos con tablas
@@ -2305,6 +2614,8 @@ async def upload_catalog(
     _fn_l = (file.filename or "").lower()
     is_aerox = ("aerox" in _sup_l) or ("aerox" in _fn_l)
     is_jehier = ("jehier" in _sup_l) or ("jehier" in _fn_l)
+    is_holcim = ("holcim" in _sup_l) or ("holcim" in _fn_l)
+    is_albany = ("albany" in _sup_l) or ("albany" in _fn_l)
 
     if "holmco" in supplier_name.lower() or "holmco" in file.filename.lower():
         supplier = get_or_create_supplier(db, supplier_name)
@@ -2729,8 +3040,10 @@ async def upload_catalog(
                 continue
 
             # Si el "código" no tiene ningún dígito en ninguna parte, probablemente no es PN
+            # EXCEPCIÓN: HOLCIM (Pricing) trae códigos/ítems sin dígitos (p.ej. 'Airfloor All').
             if not any(ch.isdigit() for ch in part_number_full):
-                continue
+                if not is_holcim:
+                    continue
 
             # Guardamos el último código visto
             last_part_code = raw_code_str
