@@ -3762,3 +3762,276 @@ def export_search_to_excel(
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+# ============================================================
+#  Endpoint: Exportación estándar (Excel padre)
+#  Columnas (según plantilla):
+#   partnumber, description, leadtime_days, moq, price_min, price_max,
+#   currency, uom, catalog, source_ref, notes
+# ============================================================
+
+_lead_num_re = re.compile(r"(\d+(?:[.,]\d+)?)")
+
+def _parse_leadtime_days(raw: Any) -> Optional[int]:
+    """
+    Convierte lead time a días (int) cuando se puede.
+    Ejemplos soportados:
+      - '10 days' -> 10
+      - '4 weeks' -> 28
+      - '2-3 weeks' -> 14 (toma el mínimo)
+      - 'on request' / 'call for information' -> None
+    """
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s or s.lower() == "nan":
+        return None
+
+    low = s.lower()
+    if any(k in low for k in ["on request", "call", "contact", "tbd", "n/a", "na", "request", "quotation", "quote"]):
+        return None
+
+    nums = _lead_num_re.findall(low)
+    if not nums:
+        return None
+
+    # tomamos el primer número (si es rango)
+    try:
+        n = float(nums[0].replace(",", "."))
+    except Exception:
+        return None
+
+    if "week" in low or "wk" in low:
+        return int(round(n * 7))
+
+    # por defecto interpretamos como días
+    return int(round(n))
+
+
+def _parse_moq_value(raw: Any) -> Tuple[Optional[Any], Optional[str]]:
+    """
+    Devuelve (moq, note_extra).
+    - Si es numérico => moq numérico.
+    - Si es texto tipo 'Call for information' => moq None y note_extra con el texto.
+    """
+    if raw is None:
+        return None, None
+    s = str(raw).strip()
+    if not s or s.lower() == "nan":
+        return None, None
+
+    low = s.lower()
+    if any(k in low for k in ["call", "on request", "request", "contact", "quotation", "quote"]):
+        return None, f"MOQ: {s}"
+
+    # intentar número (int/float)
+    m = _lead_num_re.findall(s)
+    if not m:
+        return None, None
+
+    try:
+        val = float(m[0].replace(",", "."))
+        if abs(val - int(val)) < 1e-9:
+            return int(val), None
+        return val, None
+    except Exception:
+        return None, None
+
+
+def _safe_str(v: Any) -> str:
+    if v is None:
+        return ""
+    s = str(v).strip()
+    if not s or s.lower() == "nan":
+        return ""
+    return s
+
+
+@app.get("/export/standard")
+def export_standard_excel(db: Session = Depends(get_db)):
+    """
+    Exporta **toda la base** a un Excel estándar usando la plantilla
+    'excel_estandar_template.xlsx' (debe estar junto a este main.py).
+    """
+    try:
+        import openpyxl
+        from sqlalchemy import case
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Faltan dependencias para exportar Excel: {e}")
+
+    template_path = os.path.join(BASE_DIR, "excel_estandar_template.xlsx")
+    if not os.path.exists(template_path):
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "No se encontró la plantilla 'excel_estandar_template.xlsx'. "
+                "Ponla en la misma carpeta que main.py (BASE_DIR)."
+            ),
+        )
+
+    wb = openpyxl.load_workbook(template_path)
+    ws = wb["STANDARD_EXPORT"] if "STANDARD_EXPORT" in wb.sheetnames else wb.active
+
+    # --- subquery: min/max precios por part_id ---
+    tier_agg = (
+        db.query(
+            models.PriceTier.part_id.label("pid"),
+            func.min(models.PriceTier.unit_price).label("price_min"),
+            func.max(models.PriceTier.unit_price).label("price_max"),
+            func.max(models.PriceTier.currency).label("tier_currency"),
+        )
+        .group_by(models.PriceTier.part_id)
+        .subquery()
+    )
+
+    # --- subquery: atributos relevantes (lead_time, uom, notas, source) ---
+    la = func.lower(models.PartAttribute.attr_name)
+
+    attr_agg = (
+        db.query(
+            models.PartAttribute.part_id.label("pid"),
+            func.max(case((la.in_(["lead_time", "leadtime", "ltm"]), models.PartAttribute.attr_value), else_=None)).label("lead_time"),
+            func.max(case((la.in_(["unit_code", "uom", "unit of measure", "sales unit", "unt"]), models.PartAttribute.attr_value), else_=None)).label("uom"),
+            func.max(case((la.in_(["pricing_note"]), models.PartAttribute.attr_value), else_=None)).label("pricing_note"),
+            func.max(case((la.in_(["comments", "comment"]), models.PartAttribute.attr_value), else_=None)).label("comments"),
+            func.max(case((la.in_(["remark"]), models.PartAttribute.attr_value), else_=None)).label("remark"),
+            func.max(case((la.in_(["min_qty_raw"]), models.PartAttribute.attr_value), else_=None)).label("min_qty_raw"),
+            func.max(case((la.in_(["hoja original", "sheet", "sheet_name", "sheetname"]), models.PartAttribute.attr_value), else_=None)).label("sheet_name"),
+            func.max(case((la.in_(["sección", "seccion", "section"]), models.PartAttribute.attr_value), else_=None)).label("section_name"),
+            func.max(case((la.in_(["page", "pagina", "página"]), models.PartAttribute.attr_value), else_=None)).label("page_ref"),
+        )
+        .group_by(models.PartAttribute.part_id)
+        .subquery()
+    )
+
+    # Query principal
+    q = (
+        db.query(
+            models.Part,
+            models.Catalog,
+            models.Supplier,
+            tier_agg.c.price_min,
+            tier_agg.c.price_max,
+            tier_agg.c.tier_currency,
+            attr_agg.c.lead_time,
+            attr_agg.c.uom,
+            attr_agg.c.pricing_note,
+            attr_agg.c.comments,
+            attr_agg.c.remark,
+            attr_agg.c.min_qty_raw,
+            attr_agg.c.sheet_name,
+            attr_agg.c.section_name,
+            attr_agg.c.page_ref,
+        )
+        .join(models.Catalog, models.Part.catalog_id == models.Catalog.id)
+        .join(models.Supplier, models.Part.supplier_id == models.Supplier.id)
+        .outerjoin(tier_agg, tier_agg.c.pid == models.Part.id)
+        .outerjoin(attr_agg, attr_agg.c.pid == models.Part.id)
+        .order_by(models.Supplier.name.asc(), models.Part.part_number_full.asc())
+    )
+
+    # Escribimos desde la fila 2 (la fila 1 es el header de la plantilla)
+    start_row = ws.max_row + 1 if ws.max_row and ws.max_row > 1 else 2
+
+    row_idx = start_row
+    for (part, catalog, supplier,
+         price_min, price_max, tier_currency,
+         lead_time_raw, uom_raw, pricing_note, comments, remark, min_qty_raw,
+         sheet_name, section_name, page_ref) in q.yield_per(2000):
+
+        # Partnumber + desc
+        partnumber = part.part_number_full or part.part_number_root or ""
+        desc = part.description or ""
+
+        # Lead time (days)
+        lead_days = _parse_leadtime_days(lead_time_raw)
+
+        # MOQ
+        moq_val, moq_note = _parse_moq_value(min_qty_raw)
+        if moq_val is None:
+            # fallback al min_qty_default (siempre numérico)
+            moq_val = getattr(part, "min_qty_default", None)
+
+        # Precios min/max
+        pmin = price_min if price_min is not None else getattr(part, "base_price", None)
+        pmax = price_max if price_max is not None else getattr(part, "base_price", None)
+
+        # Moneda
+        cur = (getattr(part, "currency", None) or tier_currency or "").strip() if (getattr(part, "currency", None) or tier_currency) else ""
+
+        # UOM
+        uom = _safe_str(uom_raw)
+        if not uom:
+            uom = _safe_str(getattr(part, "unit_code", None))
+
+        # Catalog (proveedor + año)
+        cat_label = f"{supplier.name} {catalog.year}".strip() if catalog and supplier else (supplier.name if supplier else "")
+
+        # Source ref (archivo + contexto si existe)
+        src_chunks = []
+        if catalog and getattr(catalog, "original_filename", None):
+            src_chunks.append(str(catalog.original_filename))
+        if _safe_str(sheet_name):
+            src_chunks.append(f"sheet:{_safe_str(sheet_name)}")
+        if _safe_str(section_name):
+            src_chunks.append(f"section:{_safe_str(section_name)}")
+        if _safe_str(page_ref):
+            src_chunks.append(f"page:{_safe_str(page_ref)}")
+        source_ref = " | ".join(src_chunks)
+
+        # Notes: juntamos varias señales útiles
+        notes = []
+        for n in [pricing_note, comments, remark]:
+            n_s = _safe_str(n)
+            if n_s:
+                notes.append(n_s)
+
+        if moq_note:
+            notes.append(moq_note)
+
+        # Si lead time venía como texto no parseable (y no está vacío), lo anotamos
+        lt_s = _safe_str(lead_time_raw)
+        if lt_s and lead_days is None and not any(k in lt_s.lower() for k in ["on request", "call", "contact", "tbd", "n/a", "na", "request"]):
+            notes.append(f"Lead time: {lt_s}")
+
+        # Dedupe notas
+        seen = set()
+        notes_dedup = []
+        for n in notes:
+            key = n.strip()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            notes_dedup.append(key)
+        notes_joined = " | ".join(notes_dedup)
+
+        ws.cell(row=row_idx, column=1, value=partnumber)
+        ws.cell(row=row_idx, column=2, value=desc)
+        ws.cell(row=row_idx, column=3, value=lead_days)
+        ws.cell(row=row_idx, column=4, value=moq_val)
+        ws.cell(row=row_idx, column=5, value=json_safe_number(pmin))
+        ws.cell(row=row_idx, column=6, value=json_safe_number(pmax))
+        ws.cell(row=row_idx, column=7, value=cur)
+        ws.cell(row=row_idx, column=8, value=uom)
+        ws.cell(row=row_idx, column=9, value=cat_label)
+        ws.cell(row=row_idx, column=10, value=source_ref)
+        ws.cell(row=row_idx, column=11, value=notes_joined)
+
+        row_idx += 1
+
+    # Auto-filter (opcional)
+    try:
+        ws.auto_filter.ref = f"A1:K{row_idx-1}"
+    except Exception:
+        pass
+
+    output = io.BytesIO()
+    wb.save(output)
+    output.seek(0)
+
+    filename = f"catalogos_standard_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
+    return StreamingResponse(
+        output,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
