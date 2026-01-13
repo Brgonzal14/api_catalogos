@@ -3768,7 +3768,7 @@ def export_search_to_excel(
 #  Columnas: partnumber | leadtime | moq | price | currency | uom | catalog | source | note
 #  Filtro opcional: ?catalog_ids=1,2,3
 # ============================================================
-@app.get("/export/standard.xlsx")
+@app.get("/catalogs/export/standard.xlsx")
 def export_standard_excel(
     catalog_ids: Optional[str] = Query(
         None, description="IDs de catálogo separados por coma. Ej: 1,2,3"
