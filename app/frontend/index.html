@@ -269,13 +269,8 @@
           <form id="searchForm" class="row g-3">
             <div class="col-md-5">
               <label class="form-label small-label">Código o descripción</label>
-              <input
-                type="text"
-                class="form-control"
-                id="searchQuery"
-                placeholder="Ej: 10296, Light Diffuser, etc."
-                required
-              />
+              <textarea class="form-control" id="searchQuery" rows="1" placeholder="Ej: 10296, Light Diffuser, etc.
+Puedes pegar una columna desde Excel (enter/tab/espacios)." required style="resize:vertical; min-height:38px; overflow:hidden;"></textarea>
             </div>
 
             <div class="col-md-3">
@@ -355,33 +350,29 @@
             </button>
           </div>
 
-<div class="d-flex flex-wrap gap-2 align-items-center mb-3">
-  <button class="btn btn-sm btn-success" onclick="exportStandardAll()">
-    ⬇ Exportar Excel estándar (todos)
-  </button>
-  <button class="btn btn-sm btn-outline-success" onclick="exportStandardSelected()">
-    ⬇ Exportar Excel estándar (seleccionados)
-  </button>
-  <span class="small text-secondary ms-1">
-    (marca 1 o más catálogos en la tabla)
-  </span>
-</div>
-
+          <div class="d-flex flex-wrap gap-2 mb-3">
+            <button class="btn btn-sm btn-primary" type="button" onclick="exportStandardAll()">
+              ⬇ Exportar Excel estándar (todos)
+            </button>
+            <button class="btn btn-sm btn-outline-primary" type="button" onclick="exportStandardSelected()">
+              ⬇ Exportar Excel estándar (seleccionados)
+            </button>
+          </div>
 
           <div class="table-responsive">
             <table class="table table-dark table-striped align-middle">
               <thead>
                 <tr>
-  <th style="width:42px;" class="text-center">
-    <input class="form-check-input" type="checkbox" id="selectAllCatalogs" title="Seleccionar todos" />
-  </th>
-  <th>ID</th>
-  <th>Proveedor</th>
-  <th>Año</th>
-  <th>Archivo Original</th>
-  <th>Fecha de Carga</th>
-  <th style="width:120px;">Acciones</th>
-</tr>
+                  <th style="width:38px;">
+                    <input class="form-check-input" type="checkbox" id="chkAllCatalogs" title="Seleccionar todos" />
+                  </th>
+                  <th>ID</th>
+                  <th>Proveedor</th>
+                  <th>Año</th>
+                  <th>Archivo Original</th>
+                  <th>Fecha de Carga</th>
+                  <th style="width:110px;">Acciones</th>
+                </tr>
               </thead>
               <tbody id="catalogsBody">
                 <tr>
@@ -484,6 +475,30 @@
   <script>
     const API_BASE = "http://localhost:8000";
     let lastResults = [];
+
+    // --- Auto-grow textarea (para pegar muchos PN) + TAB dentro del campo ---
+    const searchQueryEl = document.getElementById('searchQuery');
+    function autoGrow(el) {
+      if (!el) return;
+      el.style.height = 'auto';
+      el.style.height = Math.min(el.scrollHeight, 220) + 'px';
+    }
+    if (searchQueryEl) {
+      autoGrow(searchQueryEl);
+      searchQueryEl.addEventListener('input', () => autoGrow(searchQueryEl));
+      searchQueryEl.addEventListener('keydown', (e) => {
+        if (e.key === 'Tab') {
+          e.preventDefault();
+          const start = searchQueryEl.selectionStart;
+          const end = searchQueryEl.selectionEnd;
+          const value = searchQueryEl.value;
+          searchQueryEl.value = value.substring(0, start) + '	' + value.substring(end);
+          searchQueryEl.selectionStart = searchQueryEl.selectionEnd = start + 1;
+          autoGrow(searchQueryEl);
+        }
+      });
+    }
+
 
     // ----- Tabs -----
     const tabButtons = document.querySelectorAll(".tab-btn");
@@ -833,8 +848,8 @@
 
           const tr = document.createElement("tr");
           tr.innerHTML = `
-            <td class="text-center">
-              <input class="form-check-input catalog-select" type="checkbox" data-id="${escapeHtml(cat.id)}" />
+            <td>
+              <input class="form-check-input catalog-check" type="checkbox" data-id="${escapeHtml(cat.id)}" />
             </td>
             <td>${escapeHtml(cat.id)}</td>
             <td class="fw-bold text-primary">${escapeHtml(cat.supplier_name || "–")}</td>
@@ -842,8 +857,8 @@
             <td><code>${escapeHtml(cat.original_filename)}</code></td>
             <td class="small">${escapeHtml(dateStr)}</td>
             <td>
-              <button class="btn btn-sm btn-outline-danger" onclick="deleteCatalog(${escapeHtml(cat.id)})">
-                🗑 Eliminar
+              <button class="btn btn-sm btn-danger" type="button" onclick="deleteCatalog(${escapeHtml(cat.id)})">
+                🗑
               </button>
             </td>
           `;
@@ -852,63 +867,58 @@
       } catch (err) {
         console.error(err);
         tbody.innerHTML = `
-          <tr><td colspan="7" class="text-center text-danger">Error al cargar la lista.</td></tr>
+          <tr><td colspan="5" class="text-center text-danger">Error al cargar la lista.</td></tr>
         `;
       }
     }
 
-    
-
-// ----- Export Excel estándar -----
-function exportStandardAll() {
-  window.location.href = `${API_BASE}/export/standard.xlsx`;
-}
-
-function getSelectedCatalogIds() {
-  return Array.from(document.querySelectorAll(".catalog-select:checked"))
-    .map((el) => el.getAttribute("data-id"))
-    .filter(Boolean);
-}
-
-function exportStandardSelected() {
-  const ids = getSelectedCatalogIds();
-  if (!ids.length) {
-    alert("Selecciona al menos 1 catálogo para exportar.");
-    return;
-  }
-  const qs = encodeURIComponent(ids.join(","));
-  window.location.href = `${API_BASE}/export/standard.xlsx?catalog_ids=${qs}`;
-}
-
-// ----- Eliminar catálogo -----
-async function deleteCatalog(id) {
-  const ok = confirm(`¿Eliminar el catálogo ID ${id}? Esto borrará también sus piezas asociadas.`);
-  if (!ok) return;
-
-  try {
-    const resp = await fetch(`${API_BASE}/catalogs/${id}`, { method: "DELETE" });
-    if (!resp.ok) {
-      const t = await resp.text();
-      throw new Error(t || "Error al eliminar catálogo");
+    // ----- Exportar Excel estándar -----
+    function getSelectedCatalogIds() {
+      return Array.from(document.querySelectorAll(".catalog-check:checked"))
+        .map((el) => el.getAttribute("data-id"))
+        .filter(Boolean);
     }
-    // refrescar lista + stats
-    await loadCatalogs();
-    if (typeof loadStats === "function") await loadStats();
-  } catch (err) {
-    console.error(err);
-    alert("No se pudo eliminar el catálogo. Revisa consola/logs.");
-  }
-}
 
-// ----- Seleccionar todos -----
-document.addEventListener("change", (e) => {
-  if (e.target && e.target.id === "selectAllCatalogs") {
-    const checked = e.target.checked;
-    document.querySelectorAll(".catalog-select").forEach((cb) => (cb.checked = checked));
-  }
-});
+    function exportStandardAll() {
+      window.location.href = `${API_BASE}/catalogs/export/standard.xlsx`;
+    }
 
-const btnCatalogs = document.getElementById("btn-tab-catalogs");
+    function exportStandardSelected() {
+      const ids = getSelectedCatalogIds();
+      if (!ids.length) {
+        alert("Selecciona al menos un catálogo para exportar.");
+        return;
+      }
+      const qs = encodeURIComponent(ids.join(","));
+      window.location.href = `${API_BASE}/catalogs/export/standard.xlsx?catalog_ids=${qs}`;
+    }
+
+    // ----- Eliminar catálogo -----
+    async function deleteCatalog(id) {
+      if (!confirm(`¿Eliminar el catálogo ID ${id}? Esto borrará sus parts y precios.`)) return;
+      try {
+        const resp = await fetch(`${API_BASE}/catalogs/${id}`, { method: "DELETE" });
+        if (!resp.ok) {
+          const t = await resp.text();
+          throw new Error(t || "Error al eliminar catálogo");
+        }
+        await loadCatalogs();
+        await loadStats?.();
+      } catch (err) {
+        console.error(err);
+        alert("No se pudo eliminar el catálogo. Revisa consola/logs.");
+      }
+    }
+
+    // ----- Seleccionar todos -----
+    document.addEventListener("change", (e) => {
+      if (e.target && e.target.id === "chkAllCatalogs") {
+        const checked = e.target.checked;
+        document.querySelectorAll(".catalog-check").forEach((c) => (c.checked = checked));
+      }
+    });
+
+    const btnCatalogs = document.getElementById("btn-tab-catalogs");
     if (btnCatalogs) {
       btnCatalogs.addEventListener("click", () => {
         loadCatalogs();
