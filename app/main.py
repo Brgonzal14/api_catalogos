@@ -2721,7 +2721,6 @@ async def upload_catalog(
     is_torrington = ("torrington" in _sup_l) or ("torrington" in _fn_l)
     is_hamilton = ("hamilton" in _sup_l) or ("hamilton" in _fn_l)
     is_cml = ("cml" in _sup_l) or ("cml" in _fn_l)
-    is_collins = ("collins" in _sup_l) or ("collins" in _fn_l)
 
     if "holmco" in supplier_name.lower() or "holmco" in file.filename.lower():
         supplier = get_or_create_supplier(db, supplier_name)
@@ -2770,14 +2769,7 @@ async def upload_catalog(
                     engine="openpyxl" if ext == ".xlsx" else None,
                 )
                 for sheet_name in excel_file.sheet_names:
-                    sn_lower = (sheet_name or '').lower()
-                    if is_collins:
-                        # Collins CAT: la data real suele estar en 'Spare parts' (y algunos MRO traen 'Tabelle1')
-                        if (('spare' not in sn_lower) and ('spares' not in sn_lower) and not (sn_lower.startswith('table') or sn_lower.startswith('tabelle'))):
-                            continue
-                        tmp_df = excel_file.parse(sheet_name, header=None, dtype=str)
-                    else:
-                        tmp_df = excel_file.parse(sheet_name)
+                    tmp_df = excel_file.parse(sheet_name)
                     if not tmp_df.empty:
                         dfs.append(tmp_df)
             except Exception as e_openpyxl:
@@ -2921,14 +2913,6 @@ async def upload_catalog(
             "rf partnumber": "rf_part_number",
             "rf part no": "rf_part_number",
 
-            # COLLINS: columnas típicas
-            "um": "unit_code",
-            "pak": "package_qty",
-            "unit price 2026": "price",
-            "unit price 2026 (eur)": "price",
-            "unit price 2026 (usd)": "price",
-            "unit price 2026 mro": "price",
-
             # descripción
             "descripcion": "description", "description": "description",
 
@@ -3021,8 +3005,6 @@ async def upload_catalog(
                 mapped = "lead_time"
             elif col_key.startswith("price per unit"):
                 mapped = "price"
-            elif col_key.startswith("unit price"):
-                mapped = "price"
             elif col_key.startswith("minimum quantity") or col_key.startswith("minimum order quantity") or col_key == "moq":
                 mapped = "min_qty"
             elif col_key.startswith("unit of measure") or col_key == "sales unit":
@@ -3051,7 +3033,7 @@ async def upload_catalog(
         df = dedupe_columns(df)
 
         # Limpieza: algunas conversiones Excel/PDF dejan saltos de línea dentro de una misma celda
-        if any(c in df.columns for c in ("bauteil_nr", "variante", "description", "part_number", "article_no", "rf_part_number", "standard_part_number", "supplier_part_no")):
+        if any(c in df.columns for c in ("bauteil_nr", "variante", "description", "part_number", "article_no")):
             df = df.applymap(clean_multiline_cell)
 
         # 3.1 Heurísticas STUKERJURGEN / catálogos alemanes:
@@ -3538,22 +3520,7 @@ def search_parts(
         return []
 
     # términos separados por coma / salto de línea / ; / tab
-    chunks = [c.strip() for c in re.split(r"[,\n;\t]+", raw) if c and c.strip()]
-
-    # Soporte extra: listas pegadas con espacios (sin romper P/N con espacios tipo 'ABS0236 A 2-11')
-    terms = []
-    for c in chunks:
-        if re.search(r"\s+", c):
-            toks = [t for t in re.split(r"\s+", c) if t]
-            looks_like_list = (len(toks) > 1) and all((len(t) > 1) and (any(ch.isdigit() for ch in t) or ('X' in t.upper())) for t in toks)
-            if looks_like_list:
-                terms.extend(toks)
-            else:
-                terms.append(c)
-        else:
-            terms.append(c)
-
-    terms = [t.strip() for t in terms if t and t.strip()]
+    terms = [t.strip() for t in re.split(r"[,\n;\t]+", raw) if t.strip()]
     terms = terms[:30]
 
     groups = []
@@ -3773,9 +3740,17 @@ def delete_catalog(catalog_id: int, db: Session = Depends(get_db)):
     part_ids = [p.id for p in parts]
 
     # 3) Borrar dependencias (si NO tienes cascade configurado)
+    #    Importante: borrar aliases ANTES de borrar Part para evitar errores de FK.
     if part_ids:
+        # Aliases
+        if hasattr(models, "PartAlias"):
+            db.query(models.PartAlias).filter(models.PartAlias.part_id.in_(part_ids)).delete(synchronize_session=False)
+
+        # Tiers / atributos
         db.query(models.PriceTier).filter(models.PriceTier.part_id.in_(part_ids)).delete(synchronize_session=False)
         db.query(models.PartAttribute).filter(models.PartAttribute.part_id.in_(part_ids)).delete(synchronize_session=False)
+
+        # Parts
         db.query(models.Part).filter(models.Part.id.in_(part_ids)).delete(synchronize_session=False)
 
     # 4) Borrar el catálogo
@@ -3783,6 +3758,48 @@ def delete_catalog(catalog_id: int, db: Session = Depends(get_db)):
     db.commit()
 
     return {"message": "Catálogo eliminado", "catalog_id": catalog_id, "deleted_parts": len(part_ids)}
+
+
+@app.delete("/catalogs")
+def delete_catalogs_bulk(
+    catalog_ids: str = Query(..., description="IDs separados por coma. Ej: 1,2,3"),
+    db: Session = Depends(get_db),
+):
+    """Elimina varios catálogos a la vez (y sus parts/tiers/attrs/aliases)."""
+    try:
+        ids = [int(x) for x in (catalog_ids or "").split(",") if x.strip()]
+    except ValueError:
+        raise HTTPException(status_code=400, detail="catalog_ids inválido. Usa números separados por coma.")
+
+    if not ids:
+        raise HTTPException(status_code=400, detail="catalog_ids vacío")
+
+    # Validar que existan
+    existing = db.query(models.Catalog.id).filter(models.Catalog.id.in_(ids)).all()
+    existing_ids = sorted([r[0] for r in existing])
+    missing = sorted(list(set(ids) - set(existing_ids)))
+    if missing:
+        raise HTTPException(status_code=404, detail={"message": "Catálogo(s) no encontrado(s)", "missing_ids": missing})
+
+    # Buscar parts
+    part_ids = [r[0] for r in db.query(models.Part.id).filter(models.Part.catalog_id.in_(existing_ids)).all()]
+
+    if part_ids:
+        if hasattr(models, "PartAlias"):
+            db.query(models.PartAlias).filter(models.PartAlias.part_id.in_(part_ids)).delete(synchronize_session=False)
+        db.query(models.PriceTier).filter(models.PriceTier.part_id.in_(part_ids)).delete(synchronize_session=False)
+        db.query(models.PartAttribute).filter(models.PartAttribute.part_id.in_(part_ids)).delete(synchronize_session=False)
+        db.query(models.Part).filter(models.Part.id.in_(part_ids)).delete(synchronize_session=False)
+
+    # Borrar catálogos
+    db.query(models.Catalog).filter(models.Catalog.id.in_(existing_ids)).delete(synchronize_session=False)
+    db.commit()
+
+    return {
+        "message": "Catálogos eliminados",
+        "catalog_ids": existing_ids,
+        "deleted_parts": len(part_ids),
+    }
 
 
 @app.get("/catalogs", response_model=List[schemas.CatalogListOut])
