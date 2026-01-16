@@ -452,6 +452,100 @@ def _looks_like_diehl(first_text: str) -> bool:
     return ("diehl" in t) or ("broker net price list" in t)
 
 
+
+def _looks_like_hamilton(first_text: str) -> bool:
+    t = (first_text or "").lower()
+    # El PDF trae un header muy estable: "Cage code ... Net price ..." + nombre del fabricante
+    return ("hamilton sundstrand" in t) and ("cage code" in t) and ("net price" in t)
+
+
+def parse_pdf_hamilton(pdf_bytes: bytes) -> pd.DataFrame:
+    """
+    HAMILTON SUNDSTRAND 2026 (PDF):
+      Cage code | Manufacturer Name | Part Number | Item Description | Net price | Unit of Measure | Currency | Lead Time | Standard Package Qty | Minimum Order Qty | Catalog Year
+
+    Nota: en muchos casos pdfplumber detecta "tablas" de 1 columna (línea completa),
+    por lo que aquí parseamos por texto (PyPDF2).
+    """
+    rows: List[Dict[str, Any]] = []
+
+    pn_re = re.compile(r"^[A-Z0-9]+(?:[-/][A-Z0-9]+)*$")
+
+    for page_text in _iter_text_pages_pypdf(pdf_bytes):
+        if not page_text:
+            continue
+
+        for line in page_text.splitlines():
+            s = (line or "").strip()
+            if not s:
+                continue
+
+            low = s.lower()
+            # saltar títulos/headers
+            if low.startswith("cage code") and "net price" in low:
+                continue
+            if "catalog for" in low and "hamilton sundstrand" in low:
+                continue
+
+            tokens = s.split()
+            if len(tokens) < 11:
+                continue
+
+            year = tokens[-1]
+            if not (year.isdigit() and len(year) == 4):
+                continue
+
+            # estructura estable desde el final
+            moq = tokens[-2]
+            spq = tokens[-3]
+            lead_time = tokens[-4]
+            currency = tokens[-5]
+            uom = tokens[-6]
+            price_raw = tokens[-7]
+
+            # validar precio
+            if parse_price_value(price_raw) is None:
+                continue
+
+            # bloque central (manufacturer + pn + description)
+            price_idx = len(tokens) - 7
+            mid = tokens[1:price_idx]
+            if not mid:
+                continue
+
+            pn_idx = None
+            for i, tok in enumerate(mid):
+                if pn_re.match(tok) and any(ch.isdigit() for ch in tok):
+                    pn_idx = i
+                    break
+            if pn_idx is None:
+                continue
+
+            manufacturer = " ".join(mid[:pn_idx]).strip() or None
+            part_number = mid[pn_idx].strip()
+            description = " ".join(mid[pn_idx + 1:]).strip() or None
+
+            rows.append(
+                {
+                    "Cage code": tokens[0],
+                    "Manufacturer Name": manufacturer,
+                    "Part Number": part_number,
+                    "Item Description": description,
+                    "Net price": price_raw,
+                    "Unit of Measure": uom,
+                    "Currency": currency,
+                    "Lead Time": lead_time,
+                    "Standard Package Qty": spq,
+                    "Minimum Order Qty": moq,
+                    "Catalog Year": year,
+                }
+            )
+
+    if not rows:
+        return pd.DataFrame()
+
+    return pd.DataFrame(rows)
+
 def parse_pdf_ipeco(pdf_bytes: bytes) -> pd.DataFrame:
     """
     IPECO 2026 Dollar Price List (PDF):
@@ -1449,6 +1543,11 @@ def read_pdf_vendor_dfs(pdf_bytes: bytes) -> List[pd.DataFrame]:
             if df is not None and not df.empty:
                 return [df]
 
+        if _looks_like_hamilton(first):
+            df = parse_pdf_hamilton(pdf_bytes)
+            if df is not None and not df.empty:
+                return [df]
+
         # Nuevos proveedores 2026 (PDF):
         if _looks_like_aes(first):
             df = parse_pdf_aes(pdf_bytes)
@@ -1934,6 +2033,9 @@ def detect_header_and_qty_ranges(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[s
         "material", "material number", "material no", "material #",
         # Otros proveedores
         "pnr",
+        # CML / Torrington
+        "item number",
+        "mpn",
         "art.-nr", "art.nr", "bauteil", "bauteil-nr",
     )
     desc_markers = ("description", "bezeichnung", "desc", "designation", "désignation")
@@ -2616,6 +2718,9 @@ async def upload_catalog(
     is_jehier = ("jehier" in _sup_l) or ("jehier" in _fn_l)
     is_holcim = ("holcim" in _sup_l) or ("holcim" in _fn_l)
     is_albany = ("albany" in _sup_l) or ("albany" in _fn_l)
+    is_torrington = ("torrington" in _sup_l) or ("torrington" in _fn_l)
+    is_hamilton = ("hamilton" in _sup_l) or ("hamilton" in _fn_l)
+    is_cml = ("cml" in _sup_l) or ("cml" in _fn_l)
 
     if "holmco" in supplier_name.lower() or "holmco" in file.filename.lower():
         supplier = get_or_create_supplier(db, supplier_name)
@@ -2861,6 +2966,24 @@ async def upload_catalog(
             "price per unit": "price",
             "minimum quantity": "min_qty",
 
+
+            # --- NUEVOS EXCEL (CML / TORRINGTON) ---
+            "cml item number": "part_number",
+            "item number": "part_number",
+            "mpn": "part_number",
+            "price each": "price",
+            "price/each": "price",
+            "price ea": "price",
+            "unit pice": "price",
+            "net price": "price",
+            "pack size": "package_qty",
+            "standard package qty": "package_qty",
+            "minimum order qty": "min_qty",
+            "minimum order qty.": "min_qty",
+            "catalog year": "catalog_year",
+            "cage code": "cage_code",
+            "manufacturer name": "manufacturer_name",
+            "item description": "description",
             # otros posibles
             "unit code": "unit_code", "unit": "unit_code", "lead time": "lead_time",
             "lifecycle": "lifecycle", "cumulative": "cumulative",
@@ -3060,6 +3183,10 @@ async def upload_catalog(
             if (not description or description.strip() in ("-", "—")) and desc_hint_from_code:
                 description = str(desc_hint_from_code).strip()
 
+            # TORRINGTON: el cliente NO quiere mostrar descripción
+            if is_torrington:
+                description = ""
+
             # ---------- MONEDA ----------
             currency_val = row.get("currency", None)
             currency = (
@@ -3067,6 +3194,16 @@ async def upload_catalog(
                 if currency_val is not None and str(currency_val) != "nan"
                 else None
             )
+
+            # Normalizar símbolos (p.ej. '$' -> 'USD', '€' -> 'EUR')
+            if currency:
+                cur_norm = currency.strip().upper()
+                if cur_norm in ("$", "US$", "USD$", "USD"): 
+                    currency = "USD"
+                elif cur_norm in ("€", "EUR"): 
+                    currency = "EUR"
+                elif cur_norm in ("£", "GBP"): 
+                    currency = "GBP"
 
             # ---------- CANTIDAD MÍNIMA ----------
             min_qty = row.get("min_qty")
@@ -3319,6 +3456,12 @@ async def upload_catalog(
                     if norm_name in standard:
                         continue
                     if value is None or str(value) == "nan":
+                        continue
+
+                    # TORRINGTON: ocultar fechas de vigencia
+                    if is_torrington and norm_name.replace('_', ' ').strip() in (
+                        'begin date', 'end date', 'begin', 'end'
+                    ):
                         continue
                     if "qty/ea" in norm_name.lower():
                         continue
