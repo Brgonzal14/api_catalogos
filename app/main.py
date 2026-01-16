@@ -2721,6 +2721,7 @@ async def upload_catalog(
     is_torrington = ("torrington" in _sup_l) or ("torrington" in _fn_l)
     is_hamilton = ("hamilton" in _sup_l) or ("hamilton" in _fn_l)
     is_cml = ("cml" in _sup_l) or ("cml" in _fn_l)
+    is_collins = ("collins" in _sup_l) or ("collins" in _fn_l)
 
     if "holmco" in supplier_name.lower() or "holmco" in file.filename.lower():
         supplier = get_or_create_supplier(db, supplier_name)
@@ -2769,7 +2770,14 @@ async def upload_catalog(
                     engine="openpyxl" if ext == ".xlsx" else None,
                 )
                 for sheet_name in excel_file.sheet_names:
-                    tmp_df = excel_file.parse(sheet_name)
+                    sn_lower = (sheet_name or '').lower()
+                    if is_collins:
+                        # Collins CAT: la data real suele estar en 'Spare parts' (y algunos MRO traen 'Tabelle1')
+                        if (('spare' not in sn_lower) and ('spares' not in sn_lower) and not (sn_lower.startswith('table') or sn_lower.startswith('tabelle'))):
+                            continue
+                        tmp_df = excel_file.parse(sheet_name, header=None, dtype=str)
+                    else:
+                        tmp_df = excel_file.parse(sheet_name)
                     if not tmp_df.empty:
                         dfs.append(tmp_df)
             except Exception as e_openpyxl:
@@ -2913,6 +2921,14 @@ async def upload_catalog(
             "rf partnumber": "rf_part_number",
             "rf part no": "rf_part_number",
 
+            # COLLINS: columnas típicas
+            "um": "unit_code",
+            "pak": "package_qty",
+            "unit price 2026": "price",
+            "unit price 2026 (eur)": "price",
+            "unit price 2026 (usd)": "price",
+            "unit price 2026 mro": "price",
+
             # descripción
             "descripcion": "description", "description": "description",
 
@@ -3005,6 +3021,8 @@ async def upload_catalog(
                 mapped = "lead_time"
             elif col_key.startswith("price per unit"):
                 mapped = "price"
+            elif col_key.startswith("unit price"):
+                mapped = "price"
             elif col_key.startswith("minimum quantity") or col_key.startswith("minimum order quantity") or col_key == "moq":
                 mapped = "min_qty"
             elif col_key.startswith("unit of measure") or col_key == "sales unit":
@@ -3033,7 +3051,7 @@ async def upload_catalog(
         df = dedupe_columns(df)
 
         # Limpieza: algunas conversiones Excel/PDF dejan saltos de línea dentro de una misma celda
-        if any(c in df.columns for c in ("bauteil_nr", "variante", "description", "part_number", "article_no")):
+        if any(c in df.columns for c in ("bauteil_nr", "variante", "description", "part_number", "article_no", "rf_part_number", "standard_part_number", "supplier_part_no")):
             df = df.applymap(clean_multiline_cell)
 
         # 3.1 Heurísticas STUKERJURGEN / catálogos alemanes:
@@ -3520,7 +3538,22 @@ def search_parts(
         return []
 
     # términos separados por coma / salto de línea / ; / tab
-    terms = [t.strip() for t in re.split(r"[,\n;\t]+", raw) if t.strip()]
+    chunks = [c.strip() for c in re.split(r"[,\n;\t]+", raw) if c and c.strip()]
+
+    # Soporte extra: listas pegadas con espacios (sin romper P/N con espacios tipo 'ABS0236 A 2-11')
+    terms = []
+    for c in chunks:
+        if re.search(r"\s+", c):
+            toks = [t for t in re.split(r"\s+", c) if t]
+            looks_like_list = (len(toks) > 1) and all((len(t) > 1) and (any(ch.isdigit() for ch in t) or ('X' in t.upper())) for t in toks)
+            if looks_like_list:
+                terms.extend(toks)
+            else:
+                terms.append(c)
+        else:
+            terms.append(c)
+
+    terms = [t.strip() for t in terms if t and t.strip()]
     terms = terms[:30]
 
     groups = []
