@@ -452,6 +452,100 @@ def _looks_like_diehl(first_text: str) -> bool:
     return ("diehl" in t) or ("broker net price list" in t)
 
 
+
+def _looks_like_hamilton(first_text: str) -> bool:
+    t = (first_text or "").lower()
+    # El PDF trae un header muy estable: "Cage code ... Net price ..." + nombre del fabricante
+    return ("hamilton sundstrand" in t) and ("cage code" in t) and ("net price" in t)
+
+
+def parse_pdf_hamilton(pdf_bytes: bytes) -> pd.DataFrame:
+    """
+    HAMILTON SUNDSTRAND 2026 (PDF):
+      Cage code | Manufacturer Name | Part Number | Item Description | Net price | Unit of Measure | Currency | Lead Time | Standard Package Qty | Minimum Order Qty | Catalog Year
+
+    Nota: en muchos casos pdfplumber detecta "tablas" de 1 columna (línea completa),
+    por lo que aquí parseamos por texto (PyPDF2).
+    """
+    rows: List[Dict[str, Any]] = []
+
+    pn_re = re.compile(r"^[A-Z0-9]+(?:[-/][A-Z0-9]+)*$")
+
+    for page_text in _iter_text_pages_pypdf(pdf_bytes):
+        if not page_text:
+            continue
+
+        for line in page_text.splitlines():
+            s = (line or "").strip()
+            if not s:
+                continue
+
+            low = s.lower()
+            # saltar títulos/headers
+            if low.startswith("cage code") and "net price" in low:
+                continue
+            if "catalog for" in low and "hamilton sundstrand" in low:
+                continue
+
+            tokens = s.split()
+            if len(tokens) < 11:
+                continue
+
+            year = tokens[-1]
+            if not (year.isdigit() and len(year) == 4):
+                continue
+
+            # estructura estable desde el final
+            moq = tokens[-2]
+            spq = tokens[-3]
+            lead_time = tokens[-4]
+            currency = tokens[-5]
+            uom = tokens[-6]
+            price_raw = tokens[-7]
+
+            # validar precio
+            if parse_price_value(price_raw) is None:
+                continue
+
+            # bloque central (manufacturer + pn + description)
+            price_idx = len(tokens) - 7
+            mid = tokens[1:price_idx]
+            if not mid:
+                continue
+
+            pn_idx = None
+            for i, tok in enumerate(mid):
+                if pn_re.match(tok) and any(ch.isdigit() for ch in tok):
+                    pn_idx = i
+                    break
+            if pn_idx is None:
+                continue
+
+            manufacturer = " ".join(mid[:pn_idx]).strip() or None
+            part_number = mid[pn_idx].strip()
+            description = " ".join(mid[pn_idx + 1:]).strip() or None
+
+            rows.append(
+                {
+                    "Cage code": tokens[0],
+                    "Manufacturer Name": manufacturer,
+                    "Part Number": part_number,
+                    "Item Description": description,
+                    "Net price": price_raw,
+                    "Unit of Measure": uom,
+                    "Currency": currency,
+                    "Lead Time": lead_time,
+                    "Standard Package Qty": spq,
+                    "Minimum Order Qty": moq,
+                    "Catalog Year": year,
+                }
+            )
+
+    if not rows:
+        return pd.DataFrame()
+
+    return pd.DataFrame(rows)
+
 def parse_pdf_ipeco(pdf_bytes: bytes) -> pd.DataFrame:
     """
     IPECO 2026 Dollar Price List (PDF):
@@ -1449,6 +1543,11 @@ def read_pdf_vendor_dfs(pdf_bytes: bytes) -> List[pd.DataFrame]:
             if df is not None and not df.empty:
                 return [df]
 
+        if _looks_like_hamilton(first):
+            df = parse_pdf_hamilton(pdf_bytes)
+            if df is not None and not df.empty:
+                return [df]
+
         # Nuevos proveedores 2026 (PDF):
         if _looks_like_aes(first):
             df = parse_pdf_aes(pdf_bytes)
@@ -1934,6 +2033,9 @@ def detect_header_and_qty_ranges(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[s
         "material", "material number", "material no", "material #",
         # Otros proveedores
         "pnr",
+        # CML / Torrington
+        "item number",
+        "mpn",
         "art.-nr", "art.nr", "bauteil", "bauteil-nr",
     )
     desc_markers = ("description", "bezeichnung", "desc", "designation", "désignation")
@@ -2616,6 +2718,9 @@ async def upload_catalog(
     is_jehier = ("jehier" in _sup_l) or ("jehier" in _fn_l)
     is_holcim = ("holcim" in _sup_l) or ("holcim" in _fn_l)
     is_albany = ("albany" in _sup_l) or ("albany" in _fn_l)
+    is_torrington = ("torrington" in _sup_l) or ("torrington" in _fn_l)
+    is_hamilton = ("hamilton" in _sup_l) or ("hamilton" in _fn_l)
+    is_cml = ("cml" in _sup_l) or ("cml" in _fn_l)
 
     if "holmco" in supplier_name.lower() or "holmco" in file.filename.lower():
         supplier = get_or_create_supplier(db, supplier_name)
@@ -2861,6 +2966,24 @@ async def upload_catalog(
             "price per unit": "price",
             "minimum quantity": "min_qty",
 
+
+            # --- NUEVOS EXCEL (CML / TORRINGTON) ---
+            "cml item number": "part_number",
+            "item number": "part_number",
+            "mpn": "part_number",
+            "price each": "price",
+            "price/each": "price",
+            "price ea": "price",
+            "unit pice": "price",
+            "net price": "price",
+            "pack size": "package_qty",
+            "standard package qty": "package_qty",
+            "minimum order qty": "min_qty",
+            "minimum order qty.": "min_qty",
+            "catalog year": "catalog_year",
+            "cage code": "cage_code",
+            "manufacturer name": "manufacturer_name",
+            "item description": "description",
             # otros posibles
             "unit code": "unit_code", "unit": "unit_code", "lead time": "lead_time",
             "lifecycle": "lifecycle", "cumulative": "cumulative",
@@ -3060,6 +3183,10 @@ async def upload_catalog(
             if (not description or description.strip() in ("-", "—")) and desc_hint_from_code:
                 description = str(desc_hint_from_code).strip()
 
+            # TORRINGTON: el cliente NO quiere mostrar descripción
+            if is_torrington:
+                description = ""
+
             # ---------- MONEDA ----------
             currency_val = row.get("currency", None)
             currency = (
@@ -3067,6 +3194,16 @@ async def upload_catalog(
                 if currency_val is not None and str(currency_val) != "nan"
                 else None
             )
+
+            # Normalizar símbolos (p.ej. '$' -> 'USD', '€' -> 'EUR')
+            if currency:
+                cur_norm = currency.strip().upper()
+                if cur_norm in ("$", "US$", "USD$", "USD"): 
+                    currency = "USD"
+                elif cur_norm in ("€", "EUR"): 
+                    currency = "EUR"
+                elif cur_norm in ("£", "GBP"): 
+                    currency = "GBP"
 
             # ---------- CANTIDAD MÍNIMA ----------
             min_qty = row.get("min_qty")
@@ -3320,6 +3457,12 @@ async def upload_catalog(
                         continue
                     if value is None or str(value) == "nan":
                         continue
+
+                    # TORRINGTON: ocultar fechas de vigencia
+                    if is_torrington and norm_name.replace('_', ' ').strip() in (
+                        'begin date', 'end date', 'begin', 'end'
+                    ):
+                        continue
                     if "qty/ea" in norm_name.lower():
                         continue
                     # Evitar guardar columnas de precios por tramo (p.ej. 5-9 / 10-24 / 500...)
@@ -3370,15 +3513,20 @@ def search_parts(
         min_length=1,
         description="Código o parte de la descripción (puede ser múltiple separado por coma o líneas)",
     ),
+    vendor: str = Query(
+        None,
+        description="Proveedor (opcional). Filtra por nombre del proveedor/supplier.",
+    ),
     db: Session = Depends(get_db),
 ):
     raw = (query or "").strip()
     if not raw:
         return []
 
+    vendor_clean = (vendor or "").strip()  # ✅ nuevo
+
     # términos separados por coma / salto de línea / ; / tab
     terms = [t.strip() for t in re.split(r"[,\n;\t]+", raw) if t.strip()]
-    terms = terms[:30]
 
     groups = []
     for t in terms:
@@ -3413,14 +3561,21 @@ def search_parts(
 
     combined_filter = or_(*groups)
 
-    rows = (
+    # ✅ armamos query base
+    q = (
         db.query(models.Part, models.Supplier)
         .join(models.Supplier, models.Part.supplier_id == models.Supplier.id)
         .outerjoin(models.PartAttribute, models.PartAttribute.part_id == models.Part.id)
         .outerjoin(models.PartAlias, models.PartAlias.part_id == models.Part.id)
         .filter(combined_filter)
-        .order_by(models.Part.part_number_full)
-        .limit(200)
+    )
+
+    # ✅ filtro por proveedor si viene
+    if vendor_clean:
+        q = q.filter(models.Supplier.name.ilike(f"%{vendor_clean}%"))
+
+    rows = (
+        q.order_by(models.Part.part_number_full)
         .all()
     )
 
@@ -3472,15 +3627,18 @@ def search_parts(
         }
         results.append(item)
 
+    MAX_RESULTS = 20000
+    MAX_WILDCARD_CANDIDATES = 20000
+
     for part, supplier in rows:
         push_part(part, supplier)
+        if len(results) >= MAX_RESULTS:
+            return results
 
     # =========================================================
     # ✅ SEGUNDA PASADA: Match contra patrones con 'X' (comodín)
-    #   - Comparación usando normalize_pn() dentro de wildcard_x_match()
-    #   - Considera también aliases con X
     # =========================================================
-    if len(results) < 200:
+    if len(results) < MAX_RESULTS:
         for t in terms:
             t_clean = (t or "").strip()
             if not t_clean:
@@ -3488,41 +3646,42 @@ def search_parts(
 
             t_norm = normalize_pn(t_clean)
 
-            # Prefijo corto para traer pocos candidatos
             pref = smart_prefix(t_norm, min_len=6)
             if not pref:
                 continue
 
-            wildcard_candidates = (
+            q2 = (
                 db.query(models.Part, models.Supplier)
                 .join(models.Supplier, models.Part.supplier_id == models.Supplier.id)
                 .outerjoin(models.PartAlias, models.PartAlias.part_id == models.Part.id)
                 .filter(
                     or_(
-                        # Candidatos por part_number_full que tengan X (normalizado)
                         and_(
                             sql_normalize(models.Part.part_number_full, db).ilike(f"{pref}%"),
                             sql_normalize(models.Part.part_number_full, db).ilike("%X%"),
                         ),
-                        # Candidatos por alias que tengan X (normalizado)
                         and_(
                             sql_normalize(models.PartAlias.code, db).ilike(f"{pref}%"),
                             sql_normalize(models.PartAlias.code, db).ilike("%X%"),
                         ),
                     )
                 )
-                .limit(800)
-                .all()
+            )
+
+            # ✅ mismo filtro proveedor en wildcard
+            if vendor_clean:
+                q2 = q2.filter(models.Supplier.name.ilike(f"%{vendor_clean}%"))
+
+            wildcard_candidates = (
+                q2.limit(MAX_WILDCARD_CANDIDATES).all()
             )
 
             for part, supplier in wildcard_candidates:
                 if part.id in seen_parts:
                     continue
 
-                # Match por PN principal (wildcard_x_match ya normaliza por dentro)
                 ok = wildcard_x_match(part.part_number_full, t_clean)
 
-                # Match por alias
                 if not ok:
                     aliases = getattr(part, "aliases", None)
                     if aliases is not None:
@@ -3545,40 +3704,12 @@ def search_parts(
 
                 if ok:
                     push_part(part, supplier)
-                    if len(results) >= 200:
+                    if len(results) >= MAX_RESULTS:
                         break
 
-            if len(results) >= 200:
+            if len(results) >= MAX_RESULTS:
                 break
 
-    return results
-
-
-@app.get("/catalogs", response_model=List[schemas.CatalogListOut])
-def list_catalogs(db: Session = Depends(get_db)):
-    """
-    Lista todos los catálogos ordenados por fecha de creación (más recientes primero).
-    Incluye el nombre del proveedor haciendo un JOIN implícito o explícito.
-    """
-    # Obtenemos catálogos y cargamos la relación con Supplier
-    catalogs = (
-        db.query(models.Catalog)
-        .join(models.Supplier)
-        .order_by(models.Catalog.created_at.desc())
-        .all()
-    )
-    
-    # Formateamos la respuesta para que coincida con el esquema
-    results = []
-    for cat in catalogs:
-        results.append({
-            "id": cat.id,
-            "supplier_name": cat.supplier.name,  # Accedemos a la relación
-            "year": cat.year,
-            "original_filename": cat.original_filename,
-            "created_at": cat.created_at
-        })
-    
     return results
 
 from fastapi import HTTPException
@@ -3597,9 +3728,17 @@ def delete_catalog(catalog_id: int, db: Session = Depends(get_db)):
     part_ids = [p.id for p in parts]
 
     # 3) Borrar dependencias (si NO tienes cascade configurado)
+    #    Importante: borrar aliases ANTES de borrar Part para evitar errores de FK.
     if part_ids:
+        # Aliases
+        if hasattr(models, "PartAlias"):
+            db.query(models.PartAlias).filter(models.PartAlias.part_id.in_(part_ids)).delete(synchronize_session=False)
+
+        # Tiers / atributos
         db.query(models.PriceTier).filter(models.PriceTier.part_id.in_(part_ids)).delete(synchronize_session=False)
         db.query(models.PartAttribute).filter(models.PartAttribute.part_id.in_(part_ids)).delete(synchronize_session=False)
+
+        # Parts
         db.query(models.Part).filter(models.Part.id.in_(part_ids)).delete(synchronize_session=False)
 
     # 4) Borrar el catálogo
@@ -3607,6 +3746,48 @@ def delete_catalog(catalog_id: int, db: Session = Depends(get_db)):
     db.commit()
 
     return {"message": "Catálogo eliminado", "catalog_id": catalog_id, "deleted_parts": len(part_ids)}
+
+
+@app.delete("/catalogs")
+def delete_catalogs_bulk(
+    catalog_ids: str = Query(..., description="IDs separados por coma. Ej: 1,2,3"),
+    db: Session = Depends(get_db),
+):
+    """Elimina varios catálogos a la vez (y sus parts/tiers/attrs/aliases)."""
+    try:
+        ids = [int(x) for x in (catalog_ids or "").split(",") if x.strip()]
+    except ValueError:
+        raise HTTPException(status_code=400, detail="catalog_ids inválido. Usa números separados por coma.")
+
+    if not ids:
+        raise HTTPException(status_code=400, detail="catalog_ids vacío")
+
+    # Validar que existan
+    existing = db.query(models.Catalog.id).filter(models.Catalog.id.in_(ids)).all()
+    existing_ids = sorted([r[0] for r in existing])
+    missing = sorted(list(set(ids) - set(existing_ids)))
+    if missing:
+        raise HTTPException(status_code=404, detail={"message": "Catálogo(s) no encontrado(s)", "missing_ids": missing})
+
+    # Buscar parts
+    part_ids = [r[0] for r in db.query(models.Part.id).filter(models.Part.catalog_id.in_(existing_ids)).all()]
+
+    if part_ids:
+        if hasattr(models, "PartAlias"):
+            db.query(models.PartAlias).filter(models.PartAlias.part_id.in_(part_ids)).delete(synchronize_session=False)
+        db.query(models.PriceTier).filter(models.PriceTier.part_id.in_(part_ids)).delete(synchronize_session=False)
+        db.query(models.PartAttribute).filter(models.PartAttribute.part_id.in_(part_ids)).delete(synchronize_session=False)
+        db.query(models.Part).filter(models.Part.id.in_(part_ids)).delete(synchronize_session=False)
+
+    # Borrar catálogos
+    db.query(models.Catalog).filter(models.Catalog.id.in_(existing_ids)).delete(synchronize_session=False)
+    db.commit()
+
+    return {
+        "message": "Catálogos eliminados",
+        "catalog_ids": existing_ids,
+        "deleted_parts": len(part_ids),
+    }
 
 
 @app.get("/catalogs", response_model=List[schemas.CatalogListOut])
@@ -3635,11 +3816,273 @@ def list_catalogs(db: Session = Depends(get_db)):
     return results
 from fastapi.responses import StreamingResponse
 from collections import defaultdict
+from copy import copy as _copy
 
 # ============================================================
-#  Endpoint: Exportación (Part Number | Empresa | Precios)
-#  - NO usa joinedload(models.Part.supplier) para evitar 500
-#  - Trae todos los tramos en una sola columna
+#  Export estándar (MISMO para búsqueda y catálogos)
+#  Columnas (plantilla):
+#  partnumber | leadtime | moq | price | currency | uom | price_range | price_tiers | catalog | source | note
+# ============================================================
+STANDARD_EXPORT_HEADERS = [
+    "partnumber",
+    "leadtime",
+    "moq",
+    "price",
+    "currency",
+    "uom",
+    "price_range",
+    "price_tiers",
+    "catalog",
+    "source",
+    "note",
+]
+
+# Debes tener el archivo 'estandar.xlsx' en la misma carpeta que main.py
+STANDARD_TEMPLATE_PATH = os.path.join(BASE_DIR, "estandar.xlsx")
+
+
+def _safe_float(v: Any):
+    try:
+        if v is None or v == "":
+            return None
+        return float(v)
+    except Exception:
+        return None
+
+
+def _extract_pn_note(partnumber: str) -> Tuple[str, str]:
+    """Separa un posible comentario pegado al PN y lo manda a nota.
+
+    Ejemplos típicos:
+      - "PN123 (ON REQUEST)" -> ("PN123", "ON REQUEST")
+      - "PN123 ON REQUEST"   -> ("PN123", "ON REQUEST")
+      - "PN123*"             -> ("PN123", "*")
+
+    No intenta separar PNs que legítimamente traen espacios (ej: "ABS0236 A 2-11").
+    """
+    if not partnumber:
+        return "", ""
+
+    s = str(partnumber).strip()
+
+    # ( ... ) o [ ... ] al final
+    m = re.match(r"^(.*?)(?:\s*[\(\[]([^\)\]]+)[\)\]])\s*$", s)
+    if m:
+        base = (m.group(1) or "").strip()
+        note = (m.group(2) or "").strip()
+        if base and note:
+            return base, note
+
+    # asteriscos al final
+    m2 = re.match(r"^(.*?)(\*+)$", s)
+    if m2:
+        base = (m2.group(1) or "").strip()
+        stars = (m2.group(2) or "").strip()
+        if base and stars:
+            return base, stars
+
+    # palabras tipo comentario al final (ON REQUEST / CALL FOR PRICE / EXCHANGE / etc)
+    tokens = s.split()
+    if len(tokens) >= 2:
+        keywords = {
+            "ON", "REQUEST", "CALL", "FOR", "PRICE", "INFO", "INFORMATION",
+            "CONTACT", "QUOTE", "QTY", "MIN", "MOQ", "EXCHANGE", "EXCH", "REPAIR",
+            "TBD", "TBA", "N/A", "NA",
+        }
+        # buscamos una cola que contenga estas palabras
+        up = [t.upper() for t in tokens]
+        # si la cola contiene 'ON' y 'REQUEST'
+        joined = " ".join(up)
+        if "ON REQUEST" in joined or "CALL" in up or "QUOTE" in up or "EXCHANGE" in up or "REPAIR" in up:
+            # tomamos desde el primer keyword hasta el final
+            first_kw = None
+            for i, t in enumerate(up):
+                if t in keywords:
+                    first_kw = i
+                    break
+            if first_kw is not None and first_kw > 0:
+                base = " ".join(tokens[:first_kw]).strip()
+                note = " ".join(tokens[first_kw:]).strip()
+                # evitar separar sufijos simples tipo "A"
+                if base and note and (note.upper() in {"ON REQUEST", "CALL", "CALL FOR PRICE", "EXCHANGE", "REPAIR"} or any(k in note.upper() for k in ["ON REQUEST", "CALL", "PRICE", "EXCHANGE", "REPAIR", "QUOTE"])):
+                    return base, note
+
+    return s, ""
+
+
+def _load_standard_workbook():
+    """Carga la plantilla. Si falla, crea una planilla mínima con los headers."""
+    try:
+        import openpyxl  # type: ignore
+        wb = openpyxl.load_workbook(STANDARD_TEMPLATE_PATH)
+        ws = wb.active
+        # validar headers (fila 1)
+        for i, h in enumerate(STANDARD_EXPORT_HEADERS, start=1):
+            v = ws.cell(1, i).value
+            if str(v or "").strip().lower() != h.lower():
+                raise ValueError(f"Plantilla inválida: header col {i} esperado '{h}', encontrado '{v}'")
+        return wb, ws
+    except Exception:
+        # fallback (sin estilo)
+        import openpyxl  # type: ignore
+        from openpyxl.utils import get_column_letter
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "catalogos_standard"
+        for i, h in enumerate(STANDARD_EXPORT_HEADERS, start=1):
+            ws.cell(1, i, value=h)
+        # anchos aproximados
+        widths = [20, 14, 10, 12, 10, 12, 12, 48, 42, 36, 52]
+        for i, w in enumerate(widths, start=1):
+            ws.column_dimensions[get_column_letter(i)].width = w
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = "A1:K1"
+        return wb, ws
+
+
+def _copy_row_style(ws, src_row: int, dst_row: int, max_col: int = 11):
+    """Copia estilo (wrap, fonts, etc.) desde una fila plantilla a una fila nueva."""
+    for c in range(1, max_col + 1):
+        src = ws.cell(src_row, c)
+        dst = ws.cell(dst_row, c)
+        dst._style = _copy(src._style)
+        dst.font = _copy(src.font)
+        dst.fill = _copy(src.fill)
+        dst.border = _copy(src.border)
+        dst.alignment = _copy(src.alignment)
+        dst.number_format = src.number_format
+        dst.protection = _copy(src.protection)
+
+
+def _write_standard_rows(ws, rows: List[Dict[str, Any]]):
+    """Escribe filas en la plantilla (desde la fila 2)."""
+    start_row = 2
+    last_row = start_row + len(rows) - 1 if rows else 1
+
+    # si la plantilla tiene pocas filas pre-creadas, extendemos copiando estilo de la fila 2
+    style_src = 2 if ws.max_row >= 2 else 1
+
+    for i, row in enumerate(rows, start=start_row):
+        if i > ws.max_row:
+            _copy_row_style(ws, style_src, i, max_col=len(STANDARD_EXPORT_HEADERS))
+
+        for j, h in enumerate(STANDARD_EXPORT_HEADERS, start=1):
+            val = row.get(h)
+            # limpiar strings vacíos
+            if val == "":
+                val = None
+            ws.cell(i, j).value = val
+
+    # ajustar rango del filtro para incluir datos
+    try:
+        ws.auto_filter.ref = f"A1:K{max(1, last_row)}"
+    except Exception:
+        pass
+
+
+def _bulk_load_tiers_attrs(db: Session, part_ids: List[int]):
+    tiers_by_part: Dict[int, List[models.PriceTier]] = defaultdict(list)
+    attrs_by_part: Dict[int, Dict[str, List[str]]] = defaultdict(lambda: defaultdict(list))
+
+    if not part_ids:
+        return tiers_by_part, attrs_by_part
+
+    tiers = (
+        db.query(models.PriceTier)
+        .filter(models.PriceTier.part_id.in_(part_ids))
+        .order_by(models.PriceTier.part_id, models.PriceTier.min_qty)
+        .all()
+    )
+    for t in tiers:
+        tiers_by_part[t.part_id].append(t)
+
+    attrs = (
+        db.query(models.PartAttribute)
+        .filter(models.PartAttribute.part_id.in_(part_ids))
+        .all()
+    )
+    for a in attrs:
+        k = (a.attr_name or "").strip()
+        v = (a.attr_value or "").strip()
+        if not k or not v:
+            continue
+        attrs_by_part[a.part_id][k].append(v)
+
+    return tiers_by_part, attrs_by_part
+
+
+def _pick_attr(attrs_by_part: Dict[int, Dict[str, List[str]]], part_id: int, candidates: List[str]) -> Optional[str]:
+    amap = attrs_by_part.get(part_id) or {}
+    if not amap:
+        return None
+    lower_map = {k.lower(): k for k in amap.keys()}
+    for c in candidates:
+        key = lower_map.get(c.lower())
+        if key:
+            vals = amap.get(key) or []
+            return vals[0] if vals else None
+    return None
+
+
+def _find_attr_contains(attrs_by_part: Dict[int, Dict[str, List[str]]], part_id: int, needles: List[str]) -> Optional[str]:
+    amap = attrs_by_part.get(part_id) or {}
+    if not amap:
+        return None
+    for k, vals in amap.items():
+        lk = (k or "").lower()
+        if any(n.lower() in lk for n in needles):
+            return vals[0] if vals else None
+    return None
+
+
+def _compute_price_fields(part: Any, tlist: List[Any]) -> Tuple[Any, str, str, str]:
+    """Opción 1:
+    - 1 precio -> price numérico, price_range = NO, price_tiers vacío
+    - múltiples -> price_range = YES, price = primer tier, price_tiers con detalle (
+)
+    """
+    tlist = list(tlist or [])
+    # ordenar por min_qty
+    tlist.sort(key=lambda x: (getattr(x, "min_qty", None) is None, getattr(x, "min_qty", 0) or 0))
+
+    # moneda
+    currency = ""
+    if tlist:
+        currency = (getattr(tlist[0], "currency", None) or getattr(part, "currency", None) or "")
+    else:
+        currency = (getattr(part, "currency", None) or "")
+
+    if tlist:
+        if len(tlist) == 1:
+            t = tlist[0]
+            price = _safe_float(getattr(t, "unit_price", None))
+            return price, currency, "NO", ""
+
+        # múltiples tiers
+        base = _safe_float(getattr(tlist[0], "unit_price", None))
+        lines = []
+        for t in tlist:
+            minq = getattr(t, "min_qty", None)
+            maxq = getattr(t, "max_qty", None)
+            up = getattr(t, "unit_price", None)
+            cur = getattr(t, "currency", None) or currency or ""
+            if maxq is not None:
+                label = f"{minq}-{maxq}"
+            else:
+                label = f">={minq}"
+            lines.append(f"{label}: {up} {cur}".strip())
+        return base, currency, "YES", "\n".join(lines)
+
+    # sin tiers -> base_price
+    bp = getattr(part, "base_price", None)
+    if bp is not None:
+        return _safe_float(bp), currency, "NO", ""
+
+    return None, currency, "NO", ""
+
+
+# ============================================================
+#  Endpoint: Exportación búsqueda (MISMO formato estándar)
 # ============================================================
 @app.get("/parts/search/export")
 def export_search_to_excel(
@@ -3683,78 +4126,107 @@ def export_search_to_excel(
     combined_filter = or_(*groups)
 
     q = (
-        db.query(models.Part, models.Supplier)
+        db.query(models.Part, models.Catalog, models.Supplier)
         .join(models.Supplier, models.Part.supplier_id == models.Supplier.id)
+        .join(models.Catalog, models.Part.catalog_id == models.Catalog.id)
         .outerjoin(models.PartAttribute, models.PartAttribute.part_id == models.Part.id)
         .outerjoin(models.PartAlias, models.PartAlias.part_id == models.Part.id)
         .filter(combined_filter)
     )
 
-    # filtros opcionales
     if supplier:
         q = q.filter(models.Supplier.name.ilike(f"%{supplier}%"))
 
     if currency:
         q = q.filter(models.Part.currency == currency.upper())
 
-    rows = q.order_by(models.Part.part_number_full).limit(500).all()
+    raw_rows = q.order_by(models.Part.part_number_full).limit(500).all()
 
-    # --- traer tiers en 1 query (sin depender de relación ORM) ---
-    part_ids = [p.id for (p, s) in rows]
-    tiers_by_part = defaultdict(list)
+    # dedupe por part.id (evitar duplicados por outerjoin)
+    dedup: Dict[int, Tuple[Any, Any, Any]] = {}
+    for part, cat, sup in raw_rows:
+        if part.id not in dedup:
+            dedup[part.id] = (part, cat, sup)
 
-    if part_ids:
-        tier_rows = (
-            db.query(models.PriceTier)
-            .filter(models.PriceTier.part_id.in_(part_ids))
-            .order_by(models.PriceTier.part_id, models.PriceTier.min_qty)
-            .all()
+    rows = list(dedup.values())
+
+    part_ids = [p.id for (p, _, _) in rows]
+    tiers_by_part, attrs_by_part = _bulk_load_tiers_attrs(db, part_ids)
+
+    export_rows: List[Dict[str, Any]] = []
+    for part, catalog, sup in rows:
+        pn_raw = part.part_number_full or part.part_number_root or ""
+        pn, pn_note = _extract_pn_note(pn_raw)
+
+        # leadtime
+        leadtime = (
+            _pick_attr(attrs_by_part, part.id, ["leadtime", "lead time", "lead time (days)", "lt", "delivery"]) 
+            or _find_attr_contains(attrs_by_part, part.id, ["lead", "delivery", "turnaround"]) 
+            or ""
         )
-        for tr in tier_rows:
-            tiers_by_part[tr.part_id].append(tr)
 
-    def format_prices(part) -> str:
-        tiers = tiers_by_part.get(part.id, []) or []
+        # moq
+        moq_raw = _pick_attr(attrs_by_part, part.id, ["min_qty_raw", "moq"]) or _find_attr_contains(attrs_by_part, part.id, ["min", "moq"]) 
+        tlist = tiers_by_part.get(part.id) or []
+        moq = ""
+        if getattr(part, "min_qty_default", None) is not None:
+            moq = str(getattr(part, "min_qty_default", None))
+        elif tlist and getattr(tlist[0], "min_qty", None) is not None:
+            moq = str(getattr(tlist[0], "min_qty", None))
+        elif moq_raw:
+            moq = str(moq_raw)
 
-        if tiers:
-            chunks = []
-            for t in tiers:
-                cur = t.currency or part.currency or ""
-                if t.max_qty is not None:
-                    label = f"{t.min_qty}-{t.max_qty}"
-                else:
-                    label = f">={t.min_qty}"
-                chunks.append(f"{label}: {t.unit_price} {cur}".strip())
-            return " | ".join(chunks)
+        # uom
+        uom = (
+            _pick_attr(attrs_by_part, part.id, ["uom", "u/m", "unit", "unit of measure", "um"]) 
+            or _find_attr_contains(attrs_by_part, part.id, ["uom", "unit", "u/m"]) 
+            or ""
+        )
 
-        if part.base_price is not None:
-            cur = part.currency or ""
-            minq = part.min_qty_default or 1
-            return f">={minq}: {part.base_price} {cur}".strip()
+        # source
+        hoja = _pick_attr(attrs_by_part, part.id, ["Hoja Original", "Sheet", "sheet"]) or _find_attr_contains(attrs_by_part, part.id, ["hoja", "sheet"])
+        seccion = _pick_attr(attrs_by_part, part.id, ["Sección", "Section", "section"]) or _find_attr_contains(attrs_by_part, part.id, ["sección", "section"])
+        source_parts = []
+        if hoja:
+            source_parts.append(f"Hoja: {hoja}")
+        if seccion:
+            source_parts.append(f"Sección: {seccion}")
+        source = " | ".join(source_parts)
 
-        return ""
+        # note
+        note = _pick_attr(attrs_by_part, part.id, ["pricing_note", "note", "notes"]) or _find_attr_contains(attrs_by_part, part.id, ["note", "info", "remark"]) or ""
 
-    export_rows = []
-    for part, sup in rows:
+        if pn_note and pn_note.lower() not in (note or "").lower():
+            note = (note + " | " if note else "") + pn_note
+
+        if moq_raw and str(moq_raw) != str(moq) and str(moq_raw).lower() not in (note or "").lower():
+            note = (note + " | " if note else "") + f"MOQ raw: {moq_raw}"
+
+        price, cur, price_range, price_tiers = _compute_price_fields(part, tlist)
+
         export_rows.append(
             {
-                "Part Number": part.part_number_full or part.part_number_root or "",
-                "Empresa": sup.name if sup else "",
-                "Precios": format_prices(part),
+                "partnumber": pn,
+                "leadtime": leadtime,
+                "moq": moq,
+                "price": price,
+                "currency": cur,
+                "uom": uom,
+                "price_range": price_range,
+                "price_tiers": price_tiers,
+                "catalog": catalog.original_filename or f"{sup.name} {getattr(catalog, 'year', '')}",
+                "source": source,
+                "note": note,
             }
         )
 
-    df = pd.DataFrame(export_rows, columns=["Part Number", "Empresa", "Precios"])
+    wb, ws = _load_standard_workbook()
+    _write_standard_rows(ws, export_rows)
 
     output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df.to_excel(writer, sheet_name="Resultados", index=False)
-        ws = writer.sheets["Resultados"]
-        ws.column_dimensions["A"].width = 28
-        ws.column_dimensions["B"].width = 22
-        ws.column_dimensions["C"].width = 70
-
+    wb.save(output)
     output.seek(0)
+
     filename = f"busqueda_{normalize_pn(raw)[:20] or 'resultados'}.xlsx"
 
     return StreamingResponse(
@@ -3763,9 +4235,9 @@ def export_search_to_excel(
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
+
 # ============================================================
 #  Endpoint: Export Excel estándar (todos o por catálogo)
-#  Columnas: partnumber | leadtime | moq | price | currency | uom | catalog | source | note
 #  Filtro opcional: ?catalog_ids=1,2,3
 # ============================================================
 @app.get("/catalogs/export/standard.xlsx")
@@ -3799,101 +4271,41 @@ def export_standard_excel(
         raise HTTPException(status_code=404, detail="No hay datos para exportar con ese filtro.")
 
     part_ids = [p.id for (p, _, _) in rows]
-
-    # -------- load tiers/attributes in bulk --------
-    tiers = (
-        db.query(models.PriceTier)
-        .filter(models.PriceTier.part_id.in_(part_ids))
-        .order_by(models.PriceTier.part_id, models.PriceTier.min_qty)
-        .all()
-    )
-    tiers_by_part: Dict[int, List[models.PriceTier]] = defaultdict(list)
-    for t in tiers:
-        tiers_by_part[t.part_id].append(t)
-
-    attrs = (
-        db.query(models.PartAttribute)
-        .filter(models.PartAttribute.part_id.in_(part_ids))
-        .all()
-    )
-    attrs_by_part: Dict[int, Dict[str, List[str]]] = defaultdict(lambda: defaultdict(list))
-    for a in attrs:
-        k = (a.attr_name or "").strip()
-        v = (a.attr_value or "").strip()
-        if not k or not v:
-            continue
-        attrs_by_part[a.part_id][k].append(v)
-
-    def _pick_attr(part_id: int, candidates: List[str]) -> Optional[str]:
-        # exact match (case-insensitive)
-        amap = attrs_by_part.get(part_id) or {}
-        if not amap:
-            return None
-        lower_map = {k.lower(): k for k in amap.keys()}
-        for c in candidates:
-            key = lower_map.get(c.lower())
-            if key:
-                vals = amap.get(key) or []
-                return vals[0] if vals else None
-        return None
-
-    def _find_attr_contains(part_id: int, needles: List[str]) -> Optional[str]:
-        amap = attrs_by_part.get(part_id) or {}
-        if not amap:
-            return None
-        for k, vals in amap.items():
-            lk = k.lower()
-            if any(n.lower() in lk for n in needles):
-                return vals[0] if vals else None
-        return None
-
-    def format_price(part) -> Tuple[str, str]:
-        tlist = tiers_by_part.get(part.id) or []
-        # currency: prefer tier currency, else part currency
-        cur = (tlist[0].currency if tlist and tlist[0].currency else part.currency) or ""
-        if tlist:
-            chunks = []
-            for t in tlist:
-                if t.max_qty is not None:
-                    label = f"{t.min_qty}-{t.max_qty}"
-                else:
-                    label = f">={t.min_qty}"
-                chunks.append(f"{label}: {t.unit_price}")
-            return " | ".join(chunks), cur
-        if part.base_price is not None:
-            minq = part.min_qty_default or 1
-            return f">={minq}: {part.base_price}", cur
-        return "", cur
+    tiers_by_part, attrs_by_part = _bulk_load_tiers_attrs(db, part_ids)
 
     export_rows: List[Dict[str, Any]] = []
     for part, catalog, supplier in rows:
-        partnumber = part.part_number_full or part.part_number_root or ""
+        pn_raw = part.part_number_full or part.part_number_root or ""
+        pn, pn_note = _extract_pn_note(pn_raw)
 
-        # leadtime: intentar encontrar algo típico
+        # leadtime
         leadtime = (
-            _pick_attr(part.id, ["leadtime", "lead time", "lead time (days)", "lt", "delivery"])
-            or _find_attr_contains(part.id, ["lead", "delivery", "turnaround"])
+            _pick_attr(attrs_by_part, part.id, ["leadtime", "lead time", "lead time (days)", "lt", "delivery"]) 
+            or _find_attr_contains(attrs_by_part, part.id, ["lead", "delivery", "turnaround"]) 
             or ""
         )
 
-        # moq: numérico por defecto + raw si existe
-        moq_raw = _pick_attr(part.id, ["min_qty_raw", "moq"]) or _find_attr_contains(part.id, ["min", "moq"])
+        # moq
+        moq_raw = _pick_attr(attrs_by_part, part.id, ["min_qty_raw", "moq"]) or _find_attr_contains(attrs_by_part, part.id, ["min", "moq"]) 
+        tlist = tiers_by_part.get(part.id) or []
         moq = ""
-        if part.min_qty_default is not None:
-            moq = str(part.min_qty_default)
+        if getattr(part, "min_qty_default", None) is not None:
+            moq = str(getattr(part, "min_qty_default", None))
+        elif tlist and getattr(tlist[0], "min_qty", None) is not None:
+            moq = str(getattr(tlist[0], "min_qty", None))
         elif moq_raw:
-            moq = moq_raw
+            moq = str(moq_raw)
 
         # uom
         uom = (
-            _pick_attr(part.id, ["uom", "u/m", "unit", "unit of measure", "um"])
-            or _find_attr_contains(part.id, ["uom", "unit", "u/m"])
+            _pick_attr(attrs_by_part, part.id, ["uom", "u/m", "unit", "unit of measure", "um"]) 
+            or _find_attr_contains(attrs_by_part, part.id, ["uom", "unit", "u/m"]) 
             or ""
         )
 
-        # source: hoja/sección/página si existe
-        hoja = _pick_attr(part.id, ["Hoja Original", "Sheet", "sheet"]) or _find_attr_contains(part.id, ["hoja", "sheet"])
-        seccion = _pick_attr(part.id, ["Sección", "Section", "section"]) or _find_attr_contains(part.id, ["sección", "section"])
+        # source
+        hoja = _pick_attr(attrs_by_part, part.id, ["Hoja Original", "Sheet", "sheet"]) or _find_attr_contains(attrs_by_part, part.id, ["hoja", "sheet"])
+        seccion = _pick_attr(attrs_by_part, part.id, ["Sección", "Section", "section"]) or _find_attr_contains(attrs_by_part, part.id, ["sección", "section"])
         source_parts = []
         if hoja:
             source_parts.append(f"Hoja: {hoja}")
@@ -3902,55 +4314,39 @@ def export_standard_excel(
         source = " | ".join(source_parts)
 
         # note
-        note = _pick_attr(part.id, ["pricing_note", "note", "notes"]) or _find_attr_contains(part.id, ["note", "info", "remark"]) or ""
+        note = _pick_attr(attrs_by_part, part.id, ["pricing_note", "note", "notes"]) or _find_attr_contains(attrs_by_part, part.id, ["note", "info", "remark"]) or ""
 
-        price_str, currency = format_price(part)
+        if pn_note and pn_note.lower() not in (note or "").lower():
+            note = (note + " | " if note else "") + pn_note
 
-        # si hay moq_raw textual, dejarlo en nota también (sin pisar)
-        if moq_raw and moq_raw != moq and moq_raw.lower() not in (note or "").lower():
+        if moq_raw and str(moq_raw) != str(moq) and str(moq_raw).lower() not in (note or "").lower():
             note = (note + " | " if note else "") + f"MOQ raw: {moq_raw}"
+
+        price, cur, price_range, price_tiers = _compute_price_fields(part, tlist)
 
         export_rows.append(
             {
-                "partnumber": partnumber,
+                "partnumber": pn,
                 "leadtime": leadtime,
                 "moq": moq,
-                "price": price_str,
-                "currency": currency,
+                "price": price,
+                "currency": cur,
                 "uom": uom,
+                "price_range": price_range,
+                "price_tiers": price_tiers,
                 "catalog": catalog.original_filename or f"{supplier.name} {catalog.year}",
                 "source": source,
                 "note": note,
             }
         )
 
-    df = pd.DataFrame(
-        export_rows,
-        columns=["partnumber", "leadtime", "moq", "price", "currency", "uom", "catalog", "source", "note"],
-    )
+    wb, ws = _load_standard_workbook()
+    _write_standard_rows(ws, export_rows)
 
     output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df.to_excel(writer, sheet_name="STANDARD_EXPORT", index=False)
-        ws = writer.sheets["STANDARD_EXPORT"]
-        # widths
-        widths = {
-            "A": 28,  # partnumber
-            "B": 16,  # leadtime
-            "C": 10,  # moq
-            "D": 55,  # price
-            "E": 10,  # currency
-            "F": 10,  # uom
-            "G": 48,  # catalog
-            "H": 28,  # source
-            "I": 48,  # note
-        }
-        for col, w in widths.items():
-            ws.column_dimensions[col].width = w
-        ws.auto_filter.ref = f"A1:I1"
-        ws.freeze_panes = "A2"
-
+    wb.save(output)
     output.seek(0)
+
     fname = "catalogos_standard.xlsx" if not ids else f"catalogos_standard_{len(ids)}cats.xlsx"
 
     return StreamingResponse(
