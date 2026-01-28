@@ -3034,7 +3034,17 @@ async def upload_catalog(
 
         # Limpieza: algunas conversiones Excel/PDF dejan saltos de línea dentro de una misma celda
         if any(c in df.columns for c in ("bauteil_nr", "variante", "description", "part_number", "article_no")):
-            df = df.applymap(clean_multiline_cell)
+            cols_to_clean = [c for c in ("bauteil_nr", "variante", "description", "part_number", "article_no") if c in df.columns]
+
+    # Limpia solo columnas "texto" (object/string) para no alterar numéricos
+    for c in cols_to_clean:
+        try:
+            if str(df[c].dtype) in ("object", "string"):
+                df[c] = df[c].map(clean_multiline_cell)
+        except Exception:
+            # fallback seguro si algo raro ocurre con dtype
+            df[c] = df[c].astype(str).map(clean_multiline_cell)
+
 
         # 3.1 Heurísticas STUKERJURGEN / catálogos alemanes:
         # - En STUKERJURGEN SAC: "P/N" suele ser un número interno (article_no)

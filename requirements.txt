@@ -3,7 +3,7 @@ uvicorn[standard]
 SQLAlchemy
 psycopg2-binary
 python-multipart
-pandas
+pandas==2.2.2
 tabula-py
 PyPDF2
 python-dotenv
