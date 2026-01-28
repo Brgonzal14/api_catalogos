@@ -3200,7 +3200,7 @@ async def upload_catalog(
                 cur_norm = currency.strip().upper()
                 if cur_norm in ("$", "US$", "USD$", "USD"): 
                     currency = "USD"
-                elif cur_norm in ("€", "EUR"): 
+                elif cur_norm in ("€", "EUR", "EURO", "EUROS"): 
                     currency = "EUR"
                 elif cur_norm in ("£", "GBP"): 
                     currency = "GBP"
