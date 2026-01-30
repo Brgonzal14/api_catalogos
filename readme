@@ -85,12 +85,9 @@ catalogos-api/
 
 Docker compose up
 
-cd app -frontend
-python -m http.server 5173
-
 http://localhost:8000/docs  api
 
-http://localhost:5173/#    vista
+http://localhost:8000/    vista
 
 # 1) Apagar contenedores y borrar volúmenes (incluye la BD)
 docker compose down -v
